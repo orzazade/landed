@@ -212,9 +212,20 @@ func TestCommitInAnotherRepoTheSessionTouched(t *testing.T) {
 	}
 }
 
+// knownBirth makes creation times known on every system (Linux does not
+// report them): the notes in these tests are written once, so a file's
+// change time is its creation time.
+func knownBirth(t *testing.T) {
+	t.Helper()
+	b := birthOf
+	t.Cleanup(func() { birthOf = b })
+	birthOf = func(fi os.FileInfo) (time.Time, bool) { return fi.ModTime(), true }
+}
+
 // A note created after the decision in a shared notes folder is a landing; a
 // note created before it is not, even if it was changed later.
 func TestNewNoteIsALandingOldNoteIsNot(t *testing.T) {
+	knownBirth(t)
 	notes := t.TempDir()
 	os.WriteFile(filepath.Join(notes, "old.md"), []byte("glass lid with steam vent\n"), 0o600)
 	time.Sleep(20 * time.Millisecond)
@@ -357,6 +368,7 @@ func TestWorktreeCommitsCountOnce(t *testing.T) {
 
 // A note over the read limit is read up to the limit, and the row says so.
 func TestBigNoteIsCutNotSkipped(t *testing.T) {
+	knownBirth(t)
 	notes := t.TempDir()
 	t0 := time.Now()
 	time.Sleep(20 * time.Millisecond)
