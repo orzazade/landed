@@ -1,0 +1,12 @@
+{
+  "name": "landed",
+  "version": "0.1.0",
+  "description": "Lists the lasting decisions you made in Claude Code that never reached a commit or a file, so they get landed before they are lost.",
+  "author": {
+    "name": "orzazade"
+  },
+  "homepage": "https://github.com/orzazade/landed",
+  "repository": "https://github.com/orzazade/landed",
+  "license": "MIT",
+  "keywords": ["decisions", "hooks", "memory"]
+}

@@ -1,0 +1,15 @@
+{
+  "name": "landed",
+  "owner": {
+    "name": "orzazade"
+  },
+  "plugins": [
+    {
+      "name": "landed",
+      "description": "Lists the lasting decisions you made in Claude Code that never reached a commit or a file, so they get landed before they are lost.",
+      "category": "development",
+      "source": "./",
+      "homepage": "https://github.com/orzazade/landed"
+    }
+  ]
+}

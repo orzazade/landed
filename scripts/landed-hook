@@ -1,0 +1,15 @@
+#!/bin/sh
+# Runs the landed binary for the plugin's hooks and skill. When no binary is
+# installed it says how to get one and exits 0: a hook never blocks. The
+# PreCompact warm-up (--warm) stays silent, since its stdout would steer the
+# summary.
+for b in "$LANDED_BIN" "$(command -v landed 2>/dev/null)" "$HOME/go/bin/landed" "$HOME/.local/bin/landed"; do
+	if [ -n "$b" ] && [ -x "$b" ]; then
+		exec "$b" "$@"
+	fi
+done
+case " $* " in
+*" --warm "*) exit 0 ;;
+esac
+echo "landed could not check: the landed binary is not installed (go install github.com/orzazade/landed/cmd/landed@latest, or a release from github.com/orzazade/landed/releases)"
+exit 0
