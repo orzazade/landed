@@ -34,7 +34,7 @@ func TestWriteReport(t *testing.T) {
 	writeReport(&b, c, "48h", "4h", errors.New("1 errors while reading transcripts"))
 	got := b.String()
 	for _, want := range []string{
-		"6 decisions found: 1 landed, 1 missing, 2 ?, 2 too new",
+		"6 decisions found: 1 landed, 1 missing, 0 superseded, 2 ?, 2 too new",
 		"! transcripts not fully read",
 		"! 1 turns could not be classified",
 		"? 2 could not be checked: 1 a source could not be read; 1 landing judge failed",
@@ -71,7 +71,7 @@ func TestReportListsNoRows(t *testing.T) {
 			t.Errorf("report shows %q:\n%s", bad, got)
 		}
 	}
-	if !strings.Contains(got, "8 decisions found: 0 landed, 8 missing, 0 ?") || !strings.Contains(got, "details: landed missing --since 48h") {
+	if !strings.Contains(got, "8 decisions found: 0 landed, 8 missing, 0 superseded, 0 ?") || !strings.Contains(got, "details: landed missing --since 48h") {
 		t.Errorf("count line or details pointer missing:\n%s", got)
 	}
 }

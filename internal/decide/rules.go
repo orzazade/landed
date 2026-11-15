@@ -33,6 +33,10 @@ var (
 	// A question with no marker: asking, not deciding.
 	questionStartRe = regexp.MustCompile(`(?i)^(?:what|why|how|where|which|who|when|is|are|does|do you|did|can|could|would|will|any|have|has|was|were)\b`)
 
+	// A question after filler words ("okay how …?", "so where …?"). Only real
+	// question words count here: "ok, will use postgres, fine?" states a choice.
+	fillerQuestionRe = regexp.MustCompile(`(?i)^(?:(?:ok|okay|so|and|but|hmm+|well|um+|alright|right|then|also)[,.!]?\s+)+(?:what|why|how|where|which|is|are|can|could|does|did|do you)\b`)
+
 	// Acknowledgements and nudges that choose nothing.
 	ackRe = regexp.MustCompile(`(?i)^(?:ok|okay|k|thanks|thank you|thx|nice|cool|great|good|hi|hello|ping|status\??|continue|go on|\?+)[.!]*$`)
 )
@@ -53,7 +57,8 @@ func asked(prev string) bool {
 func Rule(t transcript.Turn) (Call, string) {
 	text := strings.TrimSpace(t.Text)
 	words := len(strings.Fields(text))
-	isQuestion := strings.Contains(text, "?") && questionStartRe.MatchString(text)
+	isQuestion := strings.Contains(text, "?") && (questionStartRe.MatchString(text) ||
+		strings.HasSuffix(text, "?") && fillerQuestionRe.MatchString(text)) // not "ok, is it this one? use it"
 	switch {
 	case t.Queue && !strings.HasSuffix(text, "?"):
 		return Decision, "queue-answer"

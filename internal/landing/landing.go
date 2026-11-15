@@ -27,12 +27,13 @@ import (
 type State int
 
 const (
-	Unknown State = iota // could not check; Why says what failed
-	Missing              // checked, no landing found
-	Landed               // Evidence says where
+	Unknown    State = iota // could not check; Why says what failed
+	Missing                 // checked, no landing found
+	Landed                  // Evidence says where
+	Superseded              // a later decision or line replaces or withdraws it; Evidence says which
 )
 
-func (s State) String() string { return [...]string{"?", "missing", "landed"}[s] }
+func (s State) String() string { return [...]string{"?", "missing", "landed", "superseded"}[s] }
 
 // Decision is one owner decision to check.
 type Decision struct {
@@ -89,6 +90,10 @@ type Sources struct {
 	// Wide: a judge reads the candidates, so changed notes (old text in them)
 	// and bus lines from any log count. Keywords alone stay narrow.
 	ChangedNotes, AllBus bool
+	// Decisions are the owner's lasting decisions of every session read,
+	// sorted by time. A later one on the same subject is a candidate, so a
+	// judge can say it replaces an earlier one.
+	Decisions []Decision
 
 	tops    map[string]topResult
 	commits map[string]commitResult
@@ -166,12 +171,12 @@ func (s *Sources) Check(d Decision) Check {
 	}
 	best := -1
 	for i, e := range cands {
-		if e.Kind != "acted" && len(e.Matched) >= minMatch {
+		if e.Kind != "acted" && e.Kind != "decision" && len(e.Matched) >= minMatch {
 			best = i // cands are ranked: the first good one is the best
 			break
 		}
 	}
-	return Finish(c, cands, best, "")
+	return Finish(c, cands, best, -1, "")
 }
 
 // Gather collects the candidates for one decision: record-file edits later in
@@ -236,6 +241,33 @@ func (s *Sources) Gather(d Decision) (Check, []Evidence) {
 		}
 	}
 	c.searched = append(c.searched, fmt.Sprintf("%d later record edits %s", edits, scope))
+
+	// 1b. The owner's later decisions in any session that share minMatch
+	// keyword words: a judge may find one that replaces this decision. They
+	// never count as its record, and are ranked and capped apart, so they
+	// never push a record out of the candidates.
+	var later []Evidence
+	if len(s.Decisions) > 0 {
+		lo := sort.Search(len(s.Decisions), func(i int) bool { return s.Decisions[i].Time.After(from) })
+		n := 0
+		for _, o := range s.Decisions[lo:] {
+			if o.Time.After(to) {
+				break
+			}
+			if o.ID == d.ID {
+				continue
+			}
+			n++
+			text := o.Summary + " | " + o.Text
+			if mt := m.match(text); len(mt) >= minMatch {
+				later = append(later, Evidence{Kind: "decision", Ref: "session " + o.Session[:min(8, len(o.Session))] + " " + firstLine(o.Text, 80),
+					When: o.Time, Matched: mt, Text: firstRunes(strings.Join(strings.Fields(text), " "), maxCandText)})
+			}
+		}
+		rank(later)
+		later = later[:min(len(later), maxActed)]
+		c.searched = append(c.searched, fmt.Sprintf("%d later decisions", n))
+	}
 
 	// 2. Git commits (all branches) in the session's repo and in every other
 	// repo the session edited files in after the decision. A folder that is not
@@ -356,14 +388,15 @@ func (s *Sources) Gather(d Decision) (Check, []Evidence) {
 		cands = cands[:maxCandidates]
 	}
 
-	// 5. What the session did right after the decision, keywords or not: a
-	// decision carried out at once (a config edit, a command) has landed. Only
-	// a judge can tell; keywords alone never pick these.
-	var acted []Evidence
+	// 5. What the session did after the decision: its first actions, keywords
+	// or not (a decision carried out at once, like a config edit or a command,
+	// has landed), and later ones that match the keywords (work done hours on,
+	// in a script or code file, not a note). Only a judge can tell; keywords
+	// alone never pick these.
+	// The later ones are ranked by keyword rarity (not taken in time order)
+	// and show their matching lines, which may sit deep in a long script.
+	var acted, late []Evidence
 	for _, a := range d.Later {
-		if len(acted) == maxActed {
-			break
-		}
 		if !in(a.Time) || (a.Tool == "Bash" && readOnly(a.Command)) {
 			continue
 		}
@@ -371,13 +404,23 @@ func (s *Sources) Gather(d Decision) (Check, []Evidence) {
 		if a.Tool == "Bash" {
 			ref, text = "shell: "+firstLine(a.Command, 80), a.Command
 		}
-		acted = append(acted, Evidence{Kind: "acted", Ref: a.Tool + " " + ref, When: a.Time,
-			Matched: m.match(text), Text: firstRunes(strings.Join(strings.Fields(text), " "), maxCandText)})
+		e := Evidence{Kind: "acted", Ref: a.Tool + " " + ref, When: a.Time, Matched: m.match(text)}
+		switch {
+		case len(acted) < maxActed:
+			e.Text = firstRunes(strings.Join(strings.Fields(text), " "), maxCandText)
+			acted = append(acted, e)
+		case len(e.Matched) >= minMatch:
+			e.Text = snippet(text, m)
+			late = append(late, e)
+		}
 	}
+	rank(late)
+	late = late[:min(len(late), maxActed)]
+	acted = append(acted, late...)
 	if len(acted) > 0 {
-		c.searched = append(c.searched, fmt.Sprintf("%d actions right after", len(acted)))
+		c.searched = append(c.searched, fmt.Sprintf("%d actions after it (%d matched later)", len(acted), len(late)))
 	}
-	return c, append(cands, acted...)
+	return c, append(append(cands, later...), acted...)
 }
 
 // Gathered reports whether Gather searched anything; when false the check is
@@ -420,13 +463,20 @@ func rank(cands []Evidence) {
 }
 
 // Finish turns a gathered check into its final state. record is the index of
-// the candidate that records the decision, or -1; why is the judge's reason
+// the candidate that records the decision, or -1; replaced is the index of the
+// candidate that replaces or withdraws it, or -1; why is the judge's reason
 // ("" when keywords alone chose).
-func Finish(c Check, cands []Evidence, record int, why string) Check {
+func Finish(c Check, cands []Evidence, record, replaced int, why string) Check {
+	if record >= 0 && record < len(cands) && cands[record].Kind == "decision" {
+		record = -1 // a later decision only states a choice again; it never records one
+	}
 	switch {
 	case record >= 0 && record < len(cands):
 		ev := cands[record]
 		c.State, c.Evidence, c.Why = Landed, &ev, why
+	case replaced >= 0 && replaced < len(cands):
+		ev := cands[replaced]
+		c.State, c.Evidence, c.Why = Superseded, &ev, why
 	case len(c.failed) > 0:
 		// A source we meant to read failed: the landing may be there.
 		c.State = Unknown
@@ -630,7 +680,7 @@ func maskQuoted(cmd string) string {
 
 // GatherVersion is part of every cached landed outcome's key: changing what
 // Gather offers the judge (sources, filters, time bounds) means bumping it.
-const GatherVersion = "g4"
+const GatherVersion = "g5"
 
 // maxActed is how many of the session's next actions a judge sees.
 const maxActed = 10

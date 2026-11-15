@@ -236,7 +236,7 @@ func cmdMissing(args []string) error {
 			continue
 		}
 		d := ch.Decision
-		fmt.Printf("%-7s %4s  %-14s %s  %q\n", ch.State, age(now, d.Time), quote(c.Projects[d.Session], 14), short(d.Session), quote(d.Text, 100))
+		fmt.Printf("%-10s %4s  %-14s %s  %q\n", ch.State, age(now, d.Time), quote(c.Projects[d.Session], 14), short(d.Session), quote(d.Text, 100))
 		if d.Summary != "" {
 			fmt.Printf("        decision: %s\n", d.Summary)
 		}
@@ -248,7 +248,11 @@ func cmdMissing(args []string) error {
 			fmt.Printf("        id: %s kind %s\n", d.ID, kind)
 		}
 		if ch.Evidence != nil {
-			fmt.Printf("        landed: %s %s (matched %s)\n", ch.Evidence.Kind, quote(ch.Evidence.Ref, 110), strings.Join(ch.Evidence.Matched, ", "))
+			label := "landed"
+			if ch.State == landing.Superseded {
+				label = "replaced by"
+			}
+			fmt.Printf("        %s: %s %s (matched %s)\n", label, ch.Evidence.Kind, quote(ch.Evidence.Ref, 110), strings.Join(ch.Evidence.Matched, ", "))
 			if ch.Why != "" {
 				fmt.Printf("        %s\n", quote(ch.Why, 200))
 			}
@@ -257,10 +261,10 @@ func cmdMissing(args []string) error {
 		}
 	}
 	for _, r := range c.Unknown {
-		fmt.Printf("%-7s %4s  %-14s %s  %q\n        why: decision call failed: %s\n", "?", age(now, r.Turn.Time), "", short(r.Turn.SessionID), quote(r.Turn.Text, 100), r.Err)
+		fmt.Printf("%-10s %4s  %-14s %s  %q\n        why: decision call failed: %s\n", "?", age(now, r.Turn.Time), "", short(r.Turn.SessionID), quote(r.Turn.Text, 100), r.Err)
 	}
-	fmt.Printf("\n%d decisions in the last %s: %d landed, %d missing, %d ? (could not check); %d too new (< %s); %d turns not classified\n",
-		len(c.Checks)+c.TooNew, *since, counts[landing.Landed], counts[landing.Missing], counts[landing.Unknown], c.TooNew, *grace, len(c.Unknown))
+	fmt.Printf("\n%d decisions in the last %s: %d landed, %d missing, %d superseded (a later decision or line replaced it), %d ? (could not check); %d too new (< %s); %d turns not classified\n",
+		len(c.Checks)+c.TooNew, *since, counts[landing.Landed], counts[landing.Missing], counts[landing.Superseded], counts[landing.Unknown], c.TooNew, *grace, len(c.Unknown))
 	for _, e := range c.Stats.Errors {
 		fmt.Fprintln(os.Stderr, "error:", e)
 	}
@@ -275,6 +279,17 @@ func cmdMissing(args []string) error {
 // keywords alone decide.
 func checkResults(ctx context.Context, res []decide.Result, sessOf map[string]*transcript.Session, src *landing.Sources,
 	now time.Time, grace time.Duration, jg *judging) (checks []landing.Check, tooNew int, unknown []decide.Result) {
+	// Every lasting decision, too new ones included: a later one may replace
+	// an earlier one.
+	src.Decisions = nil
+	for _, r := range res {
+		if r.Known && decide.Lasting(r.Verdict) {
+			s := sessOf[r.Turn.UUID]
+			src.Decisions = append(src.Decisions, landing.Decision{ID: r.Turn.UUID, Session: s.ID, Time: r.Turn.Time,
+				Text: r.Turn.Text, Summary: r.Verdict.Summary})
+		}
+	}
+	sort.Slice(src.Decisions, func(i, j int) bool { return src.Decisions[i].Time.Before(src.Decisions[j].Time) })
 	var pend []pending
 	for _, r := range res {
 		if !r.Known {

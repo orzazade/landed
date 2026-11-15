@@ -8,10 +8,11 @@ import (
 )
 
 // JudgeVersion is part of every cached judgment's key.
-const JudgeVersion = "j5"
+const JudgeVersion = "j6"
 
 const judgePrompt = `You check whether a solo developer's decision, made in a chat with an AI coding agent, was written down or carried out afterwards. Each item has the decision ("decision": a one-line summary, "words": what the developer typed) and numbered candidate records made after it: git commits, edits of notes or status files, and coordination-bus lines. Pick the candidate that records or carries out THIS decision: the same specific choice, rule or piece of work, not just the same topic or project. A commit that implements the decided work counts; a status note or bus line counts only when it states the decided choice itself (what will or must be done, or what was dropped). Text that only describes the current setup, lists the topic, or recommends something else does not count. Candidates of kind "acted" are what the agent did right after the decision (commands, file edits): pick one when it carries the decision out (does the decided work, applies the setting, files the ticket), not when it only reads, searches or asks. If no candidate does, answer -1.
-Reply with ONLY a JSON array, one object per item, in input order, no backslashes in "why": [{"id":"...","record":<candidate number or -1>,"why":"<max 12 words>"}]`
+Also say whether a candidate REPLACES or WITHDRAWS this decision ("replaced"): candidates of kind "decision" are later decisions by the same developer; one replaces this decision only when it settles the same specific question differently (a new number, a different option, the item dropped or declared out of scope). A note, commit or bus line replaces it only when it says this choice is withdrawn, cancelled, reverted or superseded. A later decision that agrees with, extends or merely mentions this one does not replace it. If none does, answer -1.
+Reply with ONLY a JSON array, one object per item, in input order, no backslashes in "why": [{"id":"...","record":<candidate number or -1>,"replaced":<candidate number or -1>,"why":"<max 12 words>"}]`
 
 // JudgeItem is one decision with its candidate records.
 type JudgeItem struct {
@@ -22,9 +23,10 @@ type JudgeItem struct {
 }
 
 type JudgeAnswer struct {
-	ID     string `json:"id"`
-	Record int    `json:"record"`
-	Why    string `json:"why"`
+	ID       string `json:"id"`
+	Record   int    `json:"record"`
+	Replaced int    `json:"replaced"` // candidate that replaces or withdraws the decision, or -1
+	Why      string `json:"why"`
 }
 
 // Judge says which candidate, if any, records each decision.
@@ -52,9 +54,10 @@ func parseJudgments(raw string, items []JudgeItem) ([]JudgeAnswer, error) {
 		raw = raw[:j+1]
 	}
 	var raws []struct {
-		ID     string `json:"id"`
-		Record *int   `json:"record"`
-		Why    string `json:"why"`
+		ID       string `json:"id"`
+		Record   *int   `json:"record"`
+		Replaced *int   `json:"replaced"`
+		Why      string `json:"why"`
 	}
 	if err := json.Unmarshal([]byte(raw), &raws); err != nil {
 		return nil, fmt.Errorf("judge reply is not a JSON array: %w", err)
@@ -62,14 +65,18 @@ func parseJudgments(raw string, items []JudgeItem) ([]JudgeAnswer, error) {
 	byID := map[string]JudgeAnswer{}
 	for _, a := range raws {
 		if a.Record != nil { // no "record": not an answer, never candidate 0
-			byID[a.ID] = JudgeAnswer{ID: a.ID, Record: *a.Record, Why: a.Why}
+			r := -1 // no "replaced": nothing replaces it, the row stays as found
+			if a.Replaced != nil {
+				r = *a.Replaced
+			}
+			byID[a.ID] = JudgeAnswer{ID: a.ID, Record: *a.Record, Replaced: r, Why: a.Why}
 		}
 	}
 	out := make([]JudgeAnswer, 0, len(items))
 	var bad []string
 	for _, it := range items {
 		a, ok := byID[it.ID]
-		if !ok || a.Record < -1 || a.Record >= len(it.Candidates) {
+		if !ok || a.Record < -1 || a.Record >= len(it.Candidates) || a.Replaced < -1 || a.Replaced >= len(it.Candidates) {
 			bad = append(bad, it.ID)
 			continue
 		}

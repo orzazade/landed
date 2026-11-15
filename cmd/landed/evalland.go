@@ -85,6 +85,7 @@ type landScore struct {
 	UncheckedMissing          int // ... no hand landing check yet
 	CalledLanded, WrongLanded int // landed rows with a hand check, and those the hand check says did not land
 	RealMisses                int // checked decisions the hand check says did not land, in any state
+	SupersededMisses          int // of those, called superseded: check by hand that a later choice really replaced them
 	FalseMissingIDs, WrongIDs []string
 }
 
@@ -99,6 +100,10 @@ func scoreLanding(checks []landing.Check, labels map[string]label, truth map[str
 			s.RealMisses++
 		}
 		switch c.State {
+		case landing.Superseded:
+			if checked && tr.Landed == "no" && lab == "decision" && labels[id].Kind != "action" {
+				s.SupersededMisses++
+			}
 		case landing.Missing:
 			s.CalledMissing++
 			switch {
@@ -135,8 +140,8 @@ func scoreLanding(checks []landing.Check, labels map[string]label, truth map[str
 
 func (s landScore) print(verbose bool) {
 	judged := s.TrueMissing + s.FalseMissingNotDecision + s.FalseMissingLanded
-	fmt.Printf("  landing over found decisions: %d landed, %d missing, %d ?\n",
-		s.States[landing.Landed], s.States[landing.Missing], s.States[landing.Unknown])
+	fmt.Printf("  landing over found decisions: %d landed, %d missing, %d superseded, %d ?\n",
+		s.States[landing.Landed], s.States[landing.Missing], s.States[landing.Superseded], s.States[landing.Unknown])
 	fmt.Printf("  missing-precision (missing rows that are real): %5.1f%%  (%d of %d hand-checked; target >= 80%%)\n",
 		pct(s.TrueMissing, judged), s.TrueMissing, judged)
 	fmt.Printf("    wrong missing rows: %d not a decision, %d did land; %d missing rows not hand-checked yet\n",
@@ -144,6 +149,7 @@ func (s landScore) print(verbose bool) {
 	fmt.Printf("  real misses shown as missing:      %5.1f%%  (%d of %d lasting decisions the hand check says never landed)\n",
 		pct(s.TrueMissing, s.RealMisses), s.TrueMissing, s.RealMisses)
 	fmt.Printf("  landed rows the hand check disputes: %d of %d\n", s.WrongLanded, s.CalledLanded)
+	fmt.Printf("  real misses called superseded:      %d (check by hand that a later choice replaced them)\n", s.SupersededMisses)
 	if verbose {
 		sort.Strings(s.FalseMissingIDs)
 		for _, id := range s.FalseMissingIDs {
@@ -168,7 +174,7 @@ func writeLandTodo(path string, checks []landing.Check, labels map[string]label,
 			continue
 		}
 		switch c.State {
-		case landing.Missing:
+		case landing.Missing, landing.Superseded: // a wrong "replaced" would hide a real miss
 			miss = append(miss, c)
 		case landing.Landed:
 			land = append(land, c)

@@ -89,8 +89,14 @@ func cmdCheck(args []string) error {
 	for _, ch := range open {
 		fmt.Printf("%-7s %q\n        why: %s\n", ch.State, quote(ch.Decision.Text, 100), quote(ch.Why, 200))
 	}
-	fmt.Printf("\n%d lasting decisions in session %s: %d landed, %d with no landing yet\n",
-		len(c.Checks), o.session, len(c.Checks)-len(open), len(open))
+	sup := 0
+	for _, ch := range c.Checks {
+		if ch.State == landing.Superseded {
+			sup++
+		}
+	}
+	fmt.Printf("\n%d lasting decisions in session %s: %d landed, %d superseded, %d with no landing yet\n",
+		len(c.Checks), o.session, len(c.Checks)-len(open)-sup, sup, len(open))
 	return runErrors(c, c.Loaded.report())
 }
 
@@ -167,10 +173,11 @@ func hookErrors(c checked) error {
 }
 
 // unlanded are the checks with no landing: missing, or ? (could not check).
+// Superseded ones are not: a later decision or line replaced them.
 func unlanded(checks []landing.Check) []landing.Check {
 	var out []landing.Check
 	for _, ch := range checks {
-		if ch.State != landing.Landed {
+		if ch.State == landing.Missing || ch.State == landing.Unknown {
 			out = append(out, ch)
 		}
 	}

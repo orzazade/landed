@@ -485,7 +485,6 @@ func TestReadOnly(t *testing.T) {
 	}
 }
 
-
 // Where file creation times cannot be read (Linux), notes still work as
 // changed notes: no error, no ? row.
 func TestNotesWithoutCreationTime(t *testing.T) {
@@ -500,5 +499,72 @@ func TestNotesWithoutCreationTime(t *testing.T) {
 	c, cands := wide.Gather(d)
 	if len(c.failed) > 0 || len(cands) != 1 || !strings.Contains(cands[0].Ref, "(changed)") {
 		t.Errorf("failed %v, candidates %+v", c.failed, cands)
+	}
+}
+
+// A later owner decision on the same subject is a candidate, so a judge can
+// say it replaces this one. Earlier decisions, this decision itself and
+// decisions after the window are not candidates.
+func TestLaterDecisionIsACandidate(t *testing.T) {
+	t0 := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
+	src := &Sources{Window: 7 * 24 * time.Hour, Now: t0.Add(30 * 24 * time.Hour), Decisions: []Decision{
+		{ID: "old", Session: "s0", Time: t0.Add(-time.Hour), Summary: "spout is plastic", Text: "the spout stays plastic"},
+		{ID: "d", Session: "s1", Time: t0, Summary: "spout is ceramic", Text: "make the spout ceramic"},
+		{ID: "new", Session: "s2", Time: t0.Add(time.Hour), Summary: "spout is steel, not ceramic", Text: "forget ceramic, the spout is steel"},
+		{ID: "late", Session: "s3", Time: t0.Add(10 * 24 * time.Hour), Summary: "spout is glass", Text: "ceramic spout out, glass spout in"},
+	}}
+	d := Decision{ID: "d", Cwd: t.TempDir(), Time: t0, Summary: "spout is ceramic", Keywords: []string{"spout", "ceramic"}}
+	c, cands := src.Gather(d)
+	var refs []string
+	for _, e := range cands {
+		if e.Kind == "decision" {
+			refs = append(refs, e.Ref)
+		}
+	}
+	if len(refs) != 1 || !strings.Contains(refs[0], "s2") {
+		t.Fatalf("decision candidates = %v, want only the later one in s2", refs)
+	}
+	i := slices.IndexFunc(cands, func(e Evidence) bool { return e.Kind == "decision" })
+	got := Finish(c, cands, -1, i, "judge: steel replaces ceramic")
+	if got.State != Superseded || got.Evidence == nil || got.Evidence.Kind != "decision" {
+		t.Errorf("replaced by a later decision: %v %+v", got.State, got.Evidence)
+	}
+	if got.State.String() != "superseded" {
+		t.Errorf("state name %q", got.State.String())
+	}
+	// A record found wins over a replacement: the decision did land.
+	withNote := append(slices.Clone(cands), Evidence{Kind: "note", Ref: "STATUS.md", Text: "spout is ceramic"})
+	if got := Finish(c, withNote, len(withNote)-1, i, ""); got.State != Landed {
+		t.Errorf("record and replaced: %v", got.State)
+	}
+	// A later decision is never the record of this one.
+	if got := Finish(c, cands, i, -1, ""); got.State == Landed {
+		t.Errorf("a later decision was taken as the record")
+	}
+}
+
+// A decision carried out late in its session (after the first actions) by
+// writing a script, not a note, is still a candidate when it matches.
+func TestLateSessionActionIsACandidate(t *testing.T) {
+	t0 := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
+	var later []transcript.Action
+	for i := range 15 {
+		later = append(later, transcript.Action{Time: t0.Add(time.Duration(i+1) * time.Minute), Tool: "Bash", Command: fmt.Sprintf("make build-%d", i)})
+	}
+	// Weaker matches first (two words each), as in a busy session.
+	for i := range 12 {
+		later = append(later, transcript.Action{Time: t0.Add(time.Hour + time.Duration(i)*time.Minute), Tool: "Bash", Command: fmt.Sprintf("echo docker up > job-%d.log", i)})
+	}
+	// The one that carries it out: the matching line sits deep in a long script.
+	later = append(later, transcript.Action{Time: t0.Add(3 * time.Hour), Tool: "Write", Path: "/x/jobs/g1/step.sh",
+		Text: strings.Repeat("echo setting up the kettle test database\n", 20) + "docker volume rm kettle-db-g1\n"})
+	src := &Sources{Window: 7 * 24 * time.Hour, Now: t0.Add(48 * time.Hour)}
+	_, cands := src.Gather(Decision{ID: "d", Cwd: t.TempDir(), Time: t0, Keywords: []string{"docker volume rm", "job scripts"}, Later: later})
+	i := slices.IndexFunc(cands, func(e Evidence) bool { return strings.Contains(e.Ref, "step.sh") })
+	if i < 0 {
+		t.Fatalf("late script write is not a candidate; got %d candidates", len(cands))
+	}
+	if !strings.Contains(cands[i].Text, "docker volume rm") {
+		t.Errorf("the judge does not see the matching line: %q", cands[i].Text)
 	}
 }

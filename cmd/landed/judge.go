@@ -106,14 +106,14 @@ func (jg *judging) finish(ctx context.Context, pend []pending) []landing.Check {
 		case !p.c.Gathered():
 			out[i] = p.c
 		case len(p.cands) == 0:
-			out[i] = landing.Finish(p.c, nil, -1, "")
+			out[i] = landing.Finish(p.c, nil, -1, -1, "")
 		default:
 			key := judgeKey(p, jg.model)
 			if j, ok, err := jg.st.Judgment(key); err != nil {
 				jg.fail(&out[i], p, "judgment cache: "+err.Error())
 			} else if ok {
 				jg.cached++
-				out[i] = landing.Finish(p.c, p.cands, j.Record, "judge: "+j.Why)
+				out[i] = landing.Finish(p.c, p.cands, j.Record, j.Replaced, "judge: "+j.Why)
 			} else {
 				asks = append(asks, ask{i, key})
 			}
@@ -175,10 +175,10 @@ func (jg *judging) finish(ctx context.Context, pend []pending) []landing.Check {
 				jg.fail(&out[a.i], p, msg)
 				continue
 			}
-			if e := jg.st.PutJudgment(store.Judgment{Key: a.key, Record: r.Record, Why: r.Why}); e != nil {
+			if e := jg.st.PutJudgment(store.Judgment{Key: a.key, Record: r.Record, Replaced: r.Replaced, Why: r.Why}); e != nil {
 				jg.errs = append(jg.errs, "judgment cache: "+e.Error())
 			}
-			out[a.i] = landing.Finish(p.c, p.cands, r.Record, "judge: "+r.Why)
+			out[a.i] = landing.Finish(p.c, p.cands, r.Record, r.Replaced, "judge: "+r.Why)
 		}
 	}
 	return out

@@ -2,6 +2,7 @@ package transcript
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -149,5 +150,67 @@ func TestTurnWithoutIDIsABadLine(t *testing.T) {
 	s := parseLines(t, userLine("", "2026-11-01T09:00:00Z", "paint the kettle blue"), userLine("t2", "2026-11-01T09:01:00Z", "and the lid too"))
 	if s.BadLines != 1 || len(s.Turns) != 1 {
 		t.Errorf("bad lines = %d, turns = %d; want 1, 1", s.BadLines, len(s.Turns))
+	}
+}
+
+// Messages one agent sends another arrive in a lead tab as user turns. They
+// are the team's words, not the owner's: a pasted bus line with its time, any
+// bus kind, and a turn that opens by naming its sender when that sender is an
+// agent already seen on this session's bus lines.
+func TestAgentMessagesAreNotOwner(t *testing.T) {
+	relays := []string{
+		"2026-11-01T17:54 DECISION crius:lead -> kettle:spout,kettle:lid — the kettle ships in three colours",
+		"2026-11-01T17:32 PASS kettle:qa -> crius:lead — lid hinge tests pass",
+		"2026-11-01T17:26 CORRECTED kettle:spout -> kettle:lid — my last note named the wrong spout",
+		"From spout-api, ANSWER to your lid ASK: yes, the hinge is steel",
+		"From qa: the whistle test passes",
+		"From qa, a whistle progress note. No verdict yet.",
+		"Crius 06:5x, answer: keep the cleanup step inside the job scripts.",
+		"spout-api → lid-flow, about the hinge: it will not touch the spout",
+		"qa → lid-flow, for your information only.",
+		"ACK from kettle:spout-api on your INFO start. My worker is stopped.",
+		"INFO from kettle:spout-api, the hinge build has started.",
+		"spout-api, for your hinge turn: Crius posted the owner's lid rule, now in TEAM.md.",
+		"lid-flow: on your hinge ASK, it is board row K4",
+		"qa: PASS the hinge check on main",
+	}
+	owner := []string{
+		"From now on, settings stay in TOML",
+		"From tomorrow, deploy at nine",
+		"Crius, stop the deploy",
+		"boiler: use the blue lid", // not an agent seen on this session's bus
+		"okay how to signin?",
+		"qa, from now on block merges on red",            // the owner addressing an agent
+		"lid-flow: park the blue lid until Monday",       // the owner labelling a topic
+		"OK from kettle:qa's side, go with the blue lid", // "OK" is not a bus kind
+		"Lead 2, own the spout from now on",
+		"qa, from now on block merges on red and tell kettle:lid",
+		"spout-api, from now on ASK me before any deploy",
+		"qa, a FAIL in CI blocks the merge from now on",
+		"lid-flow: never deploy on Friday, that is the owner's rule",
+	}
+	lines := []string{
+		userLine("x0", "2026-11-01T08:00:00Z", "2026-11-01T08:00 INFO kettle:qa -> kettle:spout-api,kettle:lid-flow — morning"),
+		userLine("x1", "2026-11-01T08:01:00Z", "Delegated task see docs:main for the brief"), // not bus-shaped: teaches no names
+	}
+	for i, r := range relays {
+		lines = append(lines, userLine(fmt.Sprintf("r%d", i), "2026-11-01T09:00:00Z", r))
+	}
+	for i, o := range owner {
+		lines = append(lines, userLine(fmt.Sprintf("o%d", i), "2026-11-01T10:00:00Z", o))
+	}
+	s := parseLines(t, lines...)
+	for _, tr := range s.Turns {
+		if strings.HasPrefix(tr.UUID, "r") {
+			t.Errorf("relay read as the owner's: %q", tr.Text)
+		}
+	}
+	for _, in := range s.Injected {
+		if strings.HasPrefix(in.UUID, "o") {
+			t.Errorf("owner text dropped as a relay: %q", in.Text)
+		}
+	}
+	if len(s.Turns) != len(owner) {
+		t.Errorf("owner turns = %d, want %d", len(s.Turns), len(owner))
 	}
 }

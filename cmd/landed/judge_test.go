@@ -31,7 +31,7 @@ func (f *fakeJudge) Judge(_ context.Context, items []decide.JudgeItem) ([]decide
 	var out []decide.JudgeAnswer
 	for _, it := range items {
 		f.ids = append(f.ids, it.ID)
-		out = append(out, decide.JudgeAnswer{ID: it.ID, Record: f.record[it.ID], Why: "made-up reason"})
+		out = append(out, decide.JudgeAnswer{ID: it.ID, Record: f.record[it.ID], Replaced: -1, Why: "made-up reason"})
 	}
 	return out, nil
 }
@@ -83,7 +83,7 @@ func (f *skipFirst) Judge(_ context.Context, items []decide.JudgeItem) ([]decide
 	f.calls++
 	var out []decide.JudgeAnswer
 	for _, it := range items {
-		out = append(out, decide.JudgeAnswer{ID: it.ID, Record: 0})
+		out = append(out, decide.JudgeAnswer{ID: it.ID, Record: 0, Replaced: -1})
 	}
 	if f.calls == 1 && len(out) > 1 {
 		return out[:len(out)-1], errors.New("judge skipped or misnumbered 1 of 2 items")
@@ -123,7 +123,7 @@ func (f *badOnce) Judge(_ context.Context, items []decide.JudgeItem) ([]decide.J
 	}
 	var out []decide.JudgeAnswer
 	for _, it := range items {
-		out = append(out, decide.JudgeAnswer{ID: it.ID, Record: -1})
+		out = append(out, decide.JudgeAnswer{ID: it.ID, Record: -1, Replaced: -1})
 	}
 	return out, nil
 }
@@ -288,7 +288,7 @@ func (f *safeJudge) Judge(_ context.Context, items []decide.JudgeItem) ([]decide
 	var out []decide.JudgeAnswer
 	for _, it := range items {
 		f.ids = append(f.ids, it.ID)
-		out = append(out, decide.JudgeAnswer{ID: it.ID, Record: 0, Why: "made-up reason"})
+		out = append(out, decide.JudgeAnswer{ID: it.ID, Record: 0, Replaced: -1, Why: "made-up reason"})
 	}
 	return out, nil
 }
@@ -336,4 +336,39 @@ func TestClassifierRefusalStopsJudge(t *testing.T) {
 	if fj.calls != 0 || got[0].State != landing.Unknown {
 		t.Errorf("calls %d, state %v (%s)", fj.calls, got[0].State, got[0].Why)
 	}
+}
+
+// The judge can say a later candidate replaces the decision: the row is
+// superseded, not missing, the answer is cached, and the hook does not list it.
+func TestJudgeReplacedIsSuperseded(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "l.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	pend := []pending{gather(t, "spout", "spout", "ceramic")}
+	fj := &replacer{}
+	jg := &judging{st: st, j: fj}
+	got := jg.finish(context.Background(), pend)
+	if got[0].State != landing.Superseded || got[0].Evidence == nil {
+		t.Fatalf("got %v %+v", got[0].State, got[0].Evidence)
+	}
+	if n := len(unlanded(got)); n != 0 {
+		t.Errorf("superseded row listed by the hook (%d rows)", n)
+	}
+	jg2 := &judging{st: st, j: fj}
+	if again := jg2.finish(context.Background(), pend); fj.calls != 1 || again[0].State != landing.Superseded {
+		t.Errorf("cached run: calls %d state %v", fj.calls, again[0].State)
+	}
+}
+
+type replacer struct{ calls int }
+
+func (f *replacer) Judge(_ context.Context, items []decide.JudgeItem) ([]decide.JudgeAnswer, error) {
+	f.calls++
+	var out []decide.JudgeAnswer
+	for _, it := range items {
+		out = append(out, decide.JudgeAnswer{ID: it.ID, Record: -1, Replaced: 0, Why: "made-up: a later choice replaces it"})
+	}
+	return out, nil
 }

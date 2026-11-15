@@ -67,8 +67,9 @@ landed report                      # one count line, including how many were res
 landed scan                        # how many of your turns were read, per project
 ```
 
-Every decision gets one of three states, and none is silent: `landed` with the evidence,
-`missing` with what was searched, or `?` (could not check) with the reason.
+Every decision gets one of four states, and none is silent: `landed` with the evidence,
+`superseded` with the later decision or line that replaced or withdrew it, `missing` with what
+was searched, or `?` (could not check) with the reason.
 
 A decision is **rescued** when one run showed it as missing and a later run found it landed.
 `landed report` counts them. That number is the reason landed exists.
@@ -80,8 +81,13 @@ an answer you give to a question the agent queued for you. One-off requests ("ch
 the url") are not counted: their result is the work itself.
 
 1. Only your own turns are read. Tool results, slash commands, notifications and text that other
-   tools type into the session are dropped.
-2. Cheap rules settle the clear cases (short answers, acknowledgements, short questions).
+   tools type into the session are dropped. So are messages one agent sends another that arrive as
+   your turns: a pasted coordination-log line, or a turn that opens with its sender ("From qa: …",
+   "qa → docs, …") when that sender is an agent named in the session's log lines. A turn that
+   opens by addressing such an agent ("qa, …") is dropped only when a log kind follows at once
+   ("qa: PASS …") or it answers that agent's ask or turn ("qa, on your … ASK: …").
+2. Cheap rules settle the clear cases (short answers, acknowledgements, short questions, also
+   after a filler word like "okay how …?").
 3. The rest goes to `claude -p --model haiku`, in batches, on your own login. landed never uses an
    API key: it removes every `ANTHROPIC_*` and `CLAUDE_CODE_USE_*` variable from the child process,
    and it stops all model calls after the first call whose login reports an API key. Each answer is cached, so a turn is
@@ -96,14 +102,17 @@ Within 7 days after the decision (`--window`), landed collects candidates:
 - Markdown edits and `git commit` commands by any session, read from the transcripts
 - Markdown notes in the memory folders and in `--notes` folders, when they are created or changed
   after the decision
-- the agent's own next commands and edits (commands that only read, like `cat` or `git show`,
-  are skipped)
+- the agent's own next commands and edits, and its later ones that match the keywords
+  (commands that only read, like `cat` or `git show`, are skipped)
+- your own later decisions on the same subject, in any session
 - optional: lines in a coordination log (`--bus`, `*.log` files of
   `TIME KIND from -> to — text`). It's off unless the folder exists.
 
 Keywords from the decision rank the candidates. A second `claude -p` call, the judge, reads the
 decision and its candidates and picks the one that records or carries out this decision, or
-none. A note counts only when it states the choice, not when it only mentions the topic.
+none. A note counts only when it states the choice, not when it only mentions the topic. The
+judge also says whether a candidate replaces the decision: a later decision of yours that settles
+the same question differently, or a line that says it was withdrawn. That row is `superseded`.
 
 ## Measured
 
@@ -147,6 +156,10 @@ All test fixtures in this repo are made up.
 - A landed result stays cached. A commit rebased away later, or a deleted note, does not undo it.
 - On Linux, file creation times are not read, so a note counts only as a changed note.
 - Repos outside the session's own repos and `~/Projects` are not searched.
+- `superseded` needs the judge: with `--no-model` a replaced decision shows as missing. The hook
+  and `/landed` see only the same session's later decisions, so a decision replaced in another
+  session is still listed there; `landed missing` sees all sessions.
+- A relayed agent message in a shape landed does not know is read as yours.
 
 ## Status
 

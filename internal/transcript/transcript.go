@@ -128,9 +128,12 @@ var injectedRe = regexp.MustCompile(`^(?:` +
 	`|STOP \(owner order` +
 	`|DECISION (?:from )?[a-z][\w-]*:[a-z][\w-]*` + // "DECISION crius:lead -> …", "DECISION from crius:lead: …"
 	`|(?:DONE|NEED|INFO|ALERT|VERIFIED|CORRECTED) [a-z][\w-]*:[a-z][\w-]*` + // pasted bus lines
+	`|\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d)?Z? [A-Z][A-Z-]+ [a-z][\w-]*:[a-z][\w-]*` + // a pasted bus line with its time, any kind
+	`|(?:ACK|INFO|ANSWER|ASK|DONE|NEED|PASS|FAIL|ALERT|DECISION|CORRECTED|VERIFIED) from [a-z][\w-]*:[a-z][\w-]*` + // "ACK from kettle:qa …"
 	`|[a-z][\w-]*:[a-z][\w-]* -> ` + // "crius:lead -> quotes:qa …"
 	`|\[crius account=` + // crius-spawn header
 	`|(?:Crius|Lead|Leader|Watchdog)(?: \([^)\n]*\)| [\dx:]+)?: ` + // "Crius (for x): …", "Lead 14:4x: …", "Leader: …"
+	`|(?:Crius|Lead|Leader|Watchdog) \d\d:\d[\dx], ` + // "Crius 06:5x, answer: …"
 	`|Crius (?:DECISION|re|on)\b|Lead ruling\b` +
 	`|(?:The )?[Oo]wner (?:wants|says|said|asked|approved|decided|go|hard rule|order|change)\b` + // the owner in the third person
 	`|Read the (?:new |newest |last |BUG )?[^\n]{0,20}?\b(?:crius:lead|LEADER|ORDER from)\b` +
@@ -170,6 +173,7 @@ func ParseFile(path string) (*Session, error) {
 			return s, fmt.Errorf("%s: %w", path, err)
 		}
 	}
+	s.dropAgentMessages()
 	if s.ID == "" {
 		s.ID = strings.TrimSuffix(filepath.Base(path), ".jsonl")
 	}
@@ -265,6 +269,60 @@ func (s *Session) handle(line []byte, lastAssistant *string) {
 		}
 		s.Turns = append(s.Turns, t)
 	}
+}
+
+// agentIDRe finds agent ids ("kettle:qa") in a relayed bus line.
+var agentIDRe = regexp.MustCompile(`\b[a-z][\w-]*:([a-z][\w-]*)\b`)
+
+// busShapeRe is a relayed line that names who sent it to whom: "… kettle:qa ->
+// kettle:lid …". Only these teach agent names; spawn briefs and watcher lines
+// do not.
+var busShapeRe = regexp.MustCompile(`\b[a-z][\w-]*:[a-z][\w-]* -> [a-z][\w-]*:[a-z]`)
+
+// senderRe is a turn that opens by naming its sender: "From qa: …",
+// "From kettle:qa, …", "spout-api → lid-flow, …". A bare "qa, …" or "qa: …"
+// is how the owner addresses an agent, so it is not a sender form.
+var senderRe = regexp.MustCompile(`^(?:From ([a-z][\w-]*(?::[a-z][\w-]*)?)[,:] |([a-z][\w-]*) (?:→|->) [a-z][\w-]*[,:] )`)
+
+// addressRe is a turn that opens by naming an agent and then talks like a
+// relay at once: a bus kind right after the name ("qa: PASS …", "api: NEED
+// for …"), or an answer to that agent's ask or turn ("api, on your hinge ASK:
+// …", "api, for your rehearsal turn: …"). The owner addresses agents too
+// ("qa, from now on …", even with ASK or FAIL later on), so team words further
+// on are not enough.
+var addressRe = regexp.MustCompile(`^([a-z][\w-]*)[,:] (?:(?:ACK|ASK|NEED|INFO|DONE|PASS|FAIL|ANSWER|DECISION)\b|[^\n]{0,60}?\b(?:on|for) your [^\n]{0,40}?\b(?:ASK|NEED|turn)\b)`)
+
+// dropAgentMessages moves to Injected the turns that open by naming their
+// sender, when that sender is an agent this session's relayed bus lines
+// name, and the turns that open by addressing such an agent in a relay's
+// words (addressRe). Owner text that opens with any
+// other word ("From now on, …", "From tomorrow, …"), or addresses an agent
+// plainly ("qa, from now on …"), stays.
+func (s *Session) dropAgentMessages() {
+	agents := map[string]bool{}
+	for _, in := range s.Injected {
+		first, _, _ := strings.Cut(in.Text, "\n")
+		if !busShapeRe.MatchString(first) {
+			continue
+		}
+		for _, m := range agentIDRe.FindAllStringSubmatch(first, -1) {
+			agents[m[0]], agents[m[1]] = true, true
+		}
+	}
+	if len(agents) == 0 {
+		return
+	}
+	kept := s.Turns[:0]
+	for _, t := range s.Turns {
+		m := senderRe.FindStringSubmatch(t.Text)
+		a := addressRe.FindStringSubmatch(t.Text)
+		if (m != nil && agents[m[1]+m[2]]) || (a != nil && agents[a[1]]) {
+			s.Injected = append(s.Injected, t)
+			continue
+		}
+		kept = append(kept, t)
+	}
+	s.Turns = kept
 }
 
 // ownerText returns the text of a user record when the owner wrote it.

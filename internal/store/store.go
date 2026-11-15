@@ -80,11 +80,15 @@ func Open(path string) (*Store, error) {
 	CREATE TABLE IF NOT EXISTS judgment (
 		key    TEXT PRIMARY KEY,
 		record INTEGER NOT NULL,
+		replaced INTEGER NOT NULL DEFAULT -1,
 		why    TEXT NOT NULL,
 		at     TEXT NOT NULL
 	)`)
 	if err == nil {
 		err = addColumn(db, "verdict", "kind", `TEXT NOT NULL DEFAULT ''`)
+	}
+	if err == nil {
+		err = addColumn(db, "judgment", "replaced", `INTEGER NOT NULL DEFAULT -1`)
 	}
 	if err != nil {
 		db.Close()
@@ -184,14 +188,15 @@ func (s *Store) PutLanding(l Landing) error {
 // decision". Key covers the decision, the prompt version and the candidates,
 // so a new candidate asks again.
 type Judgment struct {
-	Key    string
-	Record int // index of the candidate, or -1 for none
-	Why    string
+	Key      string
+	Record   int // index of the candidate, or -1 for none
+	Replaced int // index of the candidate that replaces or withdraws the decision, or -1
+	Why      string
 }
 
 func (s *Store) Judgment(key string) (Judgment, bool, error) {
 	j := Judgment{Key: key}
-	err := s.db.QueryRow(`SELECT record, why FROM judgment WHERE key=?`, key).Scan(&j.Record, &j.Why)
+	err := s.db.QueryRow(`SELECT record, replaced, why FROM judgment WHERE key=?`, key).Scan(&j.Record, &j.Replaced, &j.Why)
 	if errors.Is(err, sql.ErrNoRows) {
 		return j, false, nil
 	}
@@ -199,8 +204,8 @@ func (s *Store) Judgment(key string) (Judgment, bool, error) {
 }
 
 func (s *Store) PutJudgment(j Judgment) error {
-	_, err := s.db.Exec(`INSERT OR REPLACE INTO judgment (key, record, why, at) VALUES (?,?,?,?)`,
-		j.Key, j.Record, j.Why, time.Now().UTC().Format(time.RFC3339))
+	_, err := s.db.Exec(`INSERT OR REPLACE INTO judgment (key, record, replaced, why, at) VALUES (?,?,?,?,?)`,
+		j.Key, j.Record, j.Replaced, j.Why, time.Now().UTC().Format(time.RFC3339))
 	return err
 }
 

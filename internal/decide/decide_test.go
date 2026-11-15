@@ -29,6 +29,16 @@ func TestRules(t *testing.T) {
 		{"thanks", "", false, Not},
 		{"what does the boil sensor report?", "", false, Not},
 		{"why is the test red?", "", false, Not},
+		// a question after a filler word is still a question
+		{"okay how to signin?", "", false, Not},
+		{"so where does the boil log go?", "", false, Not},
+		{"ok, is the yaml loader still used?", "", false, Not},
+		{"ok, is it the blue one? use it", "Blue or red lid?", false, Decision}, // the answer after the question decides
+		// after a filler word only a real question word makes a question
+		{"alright, have the qa agent block merges on red, ok?", "", false, Unclear},
+		{"ok, will use postgres for the queue, fine?", "", false, Unclear},
+		{"so who owns the spout now? lead does, from today?", "", false, Unclear},
+		{"hmm, is the lid sensor wired?", "", false, Not},
 		{"what if we always keep the lid closed?", "", false, Unclear}, // a question with a marker: the model decides
 		{"should we move the whole timer module into its own package before the release?", "", false, Unclear},
 		{"the timer page loads slowly on the tablet", "", false, Unclear},
@@ -301,5 +311,15 @@ func TestFindKeepsKind(t *testing.T) {
 	res, stats := Find(context.Background(), turns, st, m, 10) // from the cache
 	if stats.Cached != 2 || res[0].Verdict.Kind != "action" || res[1].Verdict.Kind != "rule" {
 		t.Errorf("cached=%d kinds %q %q", stats.Cached, res[0].Verdict.Kind, res[1].Verdict.Kind)
+	}
+}
+
+// "replaced" names a candidate that replaces or withdraws the decision; a
+// missing one is -1, and a number outside the candidates is refused.
+func TestParseJudgmentsReplaced(t *testing.T) {
+	items := []JudgeItem{{ID: "a", Candidates: []string{"0: x", "1: y"}}, {ID: "b", Candidates: []string{"0: z"}}, {ID: "c", Candidates: []string{"0: w"}}}
+	got, err := parseJudgments(`[{"id":"a","record":-1,"replaced":1,"why":"w"},{"id":"b","record":-1,"why":"w"},{"id":"c","record":-1,"replaced":4,"why":"w"}]`, items)
+	if err == nil || len(got) != 2 || got[0].Replaced != 1 || got[1].Replaced != -1 {
+		t.Errorf("got %+v, %v; want a replaced by 1, b by -1, c refused", got, err)
 	}
 }

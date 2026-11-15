@@ -48,8 +48,8 @@ func writeReport(w io.Writer, c checked, since, grace string, readErr error) {
 	}
 	// The same counts as `landed missing`: decisions are the checked ones plus
 	// the too-new ones; turns whose decision call failed are counted apart.
-	fmt.Fprintf(w, "landed · last %s: %d decisions found: %d landed, %d missing, %d ?, %d too new (< %s)\n",
-		since, len(c.Checks)+c.TooNew, counts[landing.Landed], counts[landing.Missing], counts[landing.Unknown], c.TooNew, grace)
+	fmt.Fprintf(w, "landed · last %s: %d decisions found: %d landed, %d missing, %d superseded, %d ?, %d too new (< %s)\n",
+		since, len(c.Checks)+c.TooNew, counts[landing.Landed], counts[landing.Missing], counts[landing.Superseded], counts[landing.Unknown], c.TooNew, grace)
 	if readErr != nil {
 		fmt.Fprintln(w, "  ! transcripts not fully read")
 	}
