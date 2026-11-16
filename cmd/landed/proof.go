@@ -59,6 +59,10 @@ func alreadyLive(live []proof.Event, e proof.Event) bool {
 	return false
 }
 
+// notOwnerTurn is the state of a warned decision whose turn is not among
+// the owner turns read.
+const notOwnerTurn = "not an owner turn now (a relayed agent message, or older than --since)"
+
 func buildProof(in proofIn) proofOut {
 	var out proofOut
 	turns := map[string]transcript.Turn{}
@@ -124,7 +128,9 @@ func buildProof(in proofIn) proofOut {
 		ch, ok := in.Checks[id]
 		switch {
 		case !ok && t.UUID == "":
-			r.State = "not read (older than --since)"
+			// Not among the owner turns read: dropped since as a relayed agent
+			// message, or before --since. The loader does not say which.
+			r.State = notOwnerTurn
 		case !ok:
 			r.State = "no longer a lasting decision"
 		case ch.State == landing.Landed && ch.Evidence != nil:

@@ -124,3 +124,16 @@ func TestProofUsesStoreSeenRows(t *testing.T) {
 		}
 	}
 }
+
+// A store row whose turn is not among the owner turns read (a relayed agent
+// message a newer landed drops, or a turn before --since) must not claim
+// to be old: it says both causes.
+func TestProofRowWithNoOwnerTurn(t *testing.T) {
+	in := proofFixture()
+	in.Seen = []store.Seen{{ID: "relay-1", MissingAt: time.Date(2026, 11, 15, 9, 0, 0, 0, time.UTC)}}
+	for _, r := range buildProof(in).Rows {
+		if r.ID == "relay-1" && r.State != notOwnerTurn {
+			t.Errorf("state %q, want %q", r.State, notOwnerTurn)
+		}
+	}
+}
