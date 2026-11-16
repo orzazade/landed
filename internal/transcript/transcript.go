@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -35,6 +36,7 @@ const MaxCommand = 4000
 
 // Action is a file edit or shell command the assistant ran.
 type Action struct {
+	Session string // the session that ran it
 	Time    time.Time
 	Tool    string // Edit, Write, MultiEdit, NotebookEdit, Bash
 	Path    string // file edits
@@ -55,6 +57,19 @@ type Session struct {
 	Injected   []Turn // user turns typed by a tool (watchers, Crius relays), not the owner
 	Turns      []Turn
 	Actions    []Action
+	Warnings   []Warning // landed's own SessionStart hook messages seen in this session
+}
+
+// WarnHeader opens landed's hook message; each listed decision follows on a
+// "- " line as a Go-quoted string. Claude Code keeps the hook's stdout in the
+// transcript, so earlier warnings can be rebuilt from it.
+const WarnHeader = "Owner decisions in this session with no landing yet:"
+
+// Warning is one landed hook message: when it was shown and the decision
+// lines it listed (unquoted, as the hook cut them).
+type Warning struct {
+	Time  time.Time
+	Lines []string
 }
 
 type record struct {
@@ -68,6 +83,7 @@ type record struct {
 	IsSidechain      bool            `json:"isSidechain"`
 	IsCompactSummary bool            `json:"isCompactSummary"`
 	IsAPIError       bool            `json:"isApiErrorMessage"`
+	Attachment       json.RawMessage `json:"attachment"`
 	Origin           *origin         `json:"origin"`
 	Message          json.RawMessage `json:"message"`
 }
@@ -177,6 +193,11 @@ func ParseFile(path string) (*Session, error) {
 	if s.ID == "" {
 		s.ID = strings.TrimSuffix(filepath.Base(path), ".jsonl")
 	}
+	for i := range s.Actions {
+		if s.Actions[i].Session == "" {
+			s.Actions[i].Session = s.ID
+		}
+	}
 	if s.Cwd != "" {
 		s.Project = filepath.Base(s.Cwd)
 	}
@@ -190,6 +211,10 @@ func (s *Session) handle(line []byte, lastAssistant *string) {
 	var rec record
 	if err := json.Unmarshal(line, &rec); err != nil {
 		s.BadLines++
+		return
+	}
+	if rec.Type == "attachment" {
+		s.warning(rec)
 		return
 	}
 	if rec.Type != "user" && rec.Type != "assistant" {
@@ -236,6 +261,7 @@ func (s *Session) handle(line []byte, lastAssistant *string) {
 				}
 			case "tool_use":
 				if a, ok := action(b, ts); ok {
+					a.Session = rec.SessionID
 					s.Actions = append(s.Actions, a)
 				}
 			}
@@ -269,6 +295,38 @@ func (s *Session) handle(line []byte, lastAssistant *string) {
 		}
 		s.Turns = append(s.Turns, t)
 	}
+}
+
+// warning keeps a landed SessionStart hook message (Claude Code stores hook
+// output as an attachment record). Other attachments are ignored.
+func (s *Session) warning(rec record) {
+	if !bytes.Contains(rec.Attachment, []byte("Owner decisions in this session")) {
+		return
+	}
+	var a struct {
+		Type      string `json:"type"`
+		HookEvent string `json:"hookEvent"`
+		Stdout    string `json:"stdout"`
+	}
+	if json.Unmarshal(rec.Attachment, &a) != nil || a.HookEvent != "SessionStart" || !strings.HasPrefix(a.Stdout, WarnHeader) {
+		return
+	}
+	ts, err := time.Parse(time.RFC3339Nano, rec.Timestamp)
+	if err != nil {
+		s.BadTimes++
+		return
+	}
+	w := Warning{Time: ts}
+	for _, l := range strings.Split(a.Stdout, "\n") {
+		q, ok := strings.CutPrefix(l, "- ")
+		if !ok {
+			continue
+		}
+		if text, err := strconv.Unquote(q); err == nil {
+			w.Lines = append(w.Lines, text)
+		}
+	}
+	s.Warnings = append(s.Warnings, w)
 }
 
 // agentIDRe finds agent ids ("kettle:qa") in a relayed bus line.

@@ -229,3 +229,37 @@ func (s *Store) Rescued(since time.Time) (recent, all int, err error) {
 		since.UTC().Format(time.RFC3339)).Scan(&recent, &all)
 	return
 }
+
+// Seen is a decision a run showed as missing, and when a later run found
+// it landed (zero: not yet).
+type Seen struct {
+	ID                   string
+	MissingAt, RescuedAt time.Time
+}
+
+// SeenRows lists every decision ever shown missing.
+func (s *Store) SeenRows() ([]Seen, error) {
+	rows, err := s.db.Query(`SELECT decision_id, missing_at, COALESCE(rescued_at, '') FROM seen ORDER BY missing_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Seen
+	for rows.Next() {
+		var r Seen
+		var miss, resc string
+		if err := rows.Scan(&r.ID, &miss, &resc); err != nil {
+			return nil, err
+		}
+		if r.MissingAt, err = time.Parse(time.RFC3339, miss); err != nil {
+			return nil, fmt.Errorf("seen %s: %w", r.ID, err)
+		}
+		if resc != "" {
+			if r.RescuedAt, err = time.Parse(time.RFC3339, resc); err != nil {
+				return nil, fmt.Errorf("seen %s: %w", r.ID, err)
+			}
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}

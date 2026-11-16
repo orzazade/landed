@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/orzazade/landed/internal/store"
 	"github.com/orzazade/landed/internal/transcript"
@@ -25,6 +26,9 @@ type Stats struct {
 }
 
 const maxText, maxPrev = 1500, 400
+
+// modelWorkers is how many model calls run at once after the first.
+const modelWorkers = 4
 
 // minKeywords is how many keywords a decision needs for its landing check.
 const minKeywords = 2
@@ -65,10 +69,82 @@ func Find(ctx context.Context, turns []transcript.Turn, st *store.Store, m Model
 			ask = append(ask, i)
 		}
 	}
-	var stopped error // an API-key refusal: no more calls this run
+	// The model calls run first: the first batch alone (it proves the login),
+	// the rest a few at a time. The answers are then read in batch order.
+	type reply struct {
+		byID map[string]Answer
+		err  error
+	}
+	var batches [][]int
 	for start := 0; start < len(ask); start += batch {
-		end := min(start+batch, len(ask))
-		idx := ask[start:end]
+		batches = append(batches, ask[start:min(start+batch, len(ask))])
+	}
+	replies := make([]reply, len(batches))
+	var mu sync.Mutex
+	var stopped error // an API-key refusal: no more calls this run
+	call := func(items []Item) ([]Answer, error) {
+		mu.Lock()
+		s := stopped
+		mu.Unlock()
+		if s != nil {
+			return nil, s // never call again after an API-key refusal
+		}
+		a, err := m.Classify(ctx, items)
+		if errors.Is(err, ErrAPIKey) {
+			mu.Lock()
+			if stopped == nil {
+				stopped = err
+			}
+			mu.Unlock()
+		}
+		return a, err
+	}
+	ask1 := func(k int) {
+		idx := batches[k]
+		items := make([]Item, len(idx))
+		for j, i := range idx {
+			t := turns[i]
+			items[j] = Item{ID: t.UUID, Text: cut(t.Text, maxText), Prev: tailCut(t.PrevAssistant, maxPrev)}
+		}
+		answers, err := call(items)
+		byID := map[string]Answer{}
+		for _, a := range answers {
+			byID[a.ID] = a
+		}
+		// The model sometimes skips an item in a long batch: ask once more for those.
+		var retry []Item
+		for _, it := range items {
+			if _, ok := byID[it.ID]; !ok {
+				retry = append(retry, it)
+			}
+		}
+		if len(retry) > 0 && !errors.Is(err, ErrAPIKey) {
+			again, err2 := call(retry)
+			for _, a := range again {
+				byID[a.ID] = a
+			}
+			err = err2 // the retry's result decides whether the batch failed
+		}
+		replies[k] = reply{byID, err}
+	}
+	if m != nil && len(batches) > 0 {
+		ask1(0)
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, modelWorkers)
+		for k := 1; k < len(batches); k++ {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func() {
+				defer wg.Done()
+				defer func() { <-sem }()
+				ask1(k)
+			}()
+		}
+		wg.Wait()
+	}
+	for k, idx := range batches {
+		start := k * batch
+		end := start + len(idx)
 		if m == nil {
 			for _, i := range idx {
 				if res[i].Verdict.Decision {
@@ -81,39 +157,7 @@ func Find(ctx context.Context, turns []transcript.Turn, st *store.Store, m Model
 			}
 			continue
 		}
-		items := make([]Item, len(idx))
-		for k, i := range idx {
-			t := turns[i]
-			items[k] = Item{ID: t.UUID, Text: cut(t.Text, maxText), Prev: tailCut(t.PrevAssistant, maxPrev)}
-		}
-		var answers []Answer
-		var err error
-		if stopped != nil {
-			err = stopped // never call again after an API-key refusal
-		} else if answers, err = m.Classify(ctx, items); errors.Is(err, ErrAPIKey) {
-			stopped = err
-		}
-		byID := map[string]Answer{}
-		for _, a := range answers {
-			byID[a.ID] = a
-		}
-		// The model sometimes skips an item in a long batch: ask once more for those.
-		var retry []Item
-		for _, it := range items {
-			if _, ok := byID[it.ID]; !ok {
-				retry = append(retry, it)
-			}
-		}
-		if len(retry) > 0 && stopped == nil {
-			again, err2 := m.Classify(ctx, retry)
-			if errors.Is(err2, ErrAPIKey) {
-				stopped = err2
-			}
-			for _, a := range again {
-				byID[a.ID] = a
-			}
-			err = err2 // the retry's result decides whether the batch failed
-		}
+		byID, err := replies[k].byID, replies[k].err
 		if err != nil {
 			stats.Errors = append(stats.Errors, fmt.Errorf("model batch %d-%d: %w", start, end, err))
 		}

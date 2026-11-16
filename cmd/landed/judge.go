@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -26,8 +27,9 @@ type pending struct {
 type judging struct {
 	st            *store.Store
 	j             decide.Judge
-	model         string // part of the cache key
-	batch         int    // decisions per call; 0: 8
+	v             decide.Verifier // checks each pick on its own; nil: picks stand
+	model         string          // part of the cache key
+	batch         int             // decisions per call; 0: 8
 	errs          []string
 	cached, asked int
 	reused        int   // landed outcomes reused from earlier runs
@@ -86,21 +88,27 @@ func (jg *judging) keepLandings(checks []landing.Check, window time.Duration) {
 	}
 }
 
-func judgeItem(p pending) decide.JudgeItem {
+// judgeItem is what the judge reads for one decision. Candidates an
+// earlier round's check refused are shown as ruled out, keeping their numbers.
+func judgeItem(p pending, ruled map[int]string) decide.JudgeItem {
 	it := decide.JudgeItem{ID: p.c.Decision.ID, Decision: p.c.Decision.Summary, Words: quote(p.c.Decision.Text, 600)}
 	for i, e := range p.cands {
+		if why, out := ruled[i]; out {
+			it.Candidates = append(it.Candidates, fmt.Sprintf("%d: (ruled out: %s)", i, why))
+			continue
+		}
 		it.Candidates = append(it.Candidates, fmt.Sprintf("%d: %s %s | %s", i, e.Kind, e.Ref, e.Text))
 	}
 	return it
 }
 
+// judgeRounds is how often a decision is judged when the check refuses
+// the pick: the first pick, then twice more with refused picks ruled out.
+const judgeRounds = 3
+
 func (jg *judging) finish(ctx context.Context, pend []pending) []landing.Check {
 	out := make([]landing.Check, len(pend))
-	type ask struct {
-		i   int
-		key string
-	}
-	var asks []ask
+	var asks []pick
 	for i, p := range pend {
 		switch {
 		case !p.c.Gathered():
@@ -115,15 +123,48 @@ func (jg *judging) finish(ctx context.Context, pend []pending) []landing.Check {
 				jg.cached++
 				out[i] = landing.Finish(p.c, p.cands, j.Record, j.Replaced, "judge: "+j.Why)
 			} else {
-				asks = append(asks, ask{i, key})
+				asks = append(asks, pick{i: i, key: key, ruled: map[int]string{}})
 			}
 		}
 	}
+	for round := 1; len(asks) > 0; round++ {
+		picks := jg.round(ctx, pend, asks, out)
+		jg.verify(ctx, pend, picks)
+		asks = nil
+		for _, pk := range picks {
+			p, r := pend[pk.i], pk.ans
+			if pk.failed != "" {
+				jg.fail(&out[pk.i], p, pk.failed)
+				continue
+			}
+			if _, again := pk.ruled[r.Record]; again {
+				r.Record, r.Why = -1, "judge picked a ruled-out candidate again" // its own reason would say "recorded"
+			}
+			if pk.refused >= 0 {
+				pk.ruled[pk.refused] = pk.ans.Why
+				if round < judgeRounds {
+					pk.refused = -1
+					asks = append(asks, pk)
+					continue
+				}
+			}
+			if e := jg.st.PutJudgment(store.Judgment{Key: pk.key, Record: r.Record, Replaced: r.Replaced, Why: r.Why}); e != nil {
+				jg.errs = append(jg.errs, "judgment cache: "+e.Error())
+			}
+			out[pk.i] = landing.Finish(p.c, p.cands, r.Record, r.Replaced, "judge: "+r.Why)
+		}
+	}
+	return out
+}
+
+// round asks the judge about every ask, in batches; a decision the judge
+// does not answer becomes ? in out.
+func (jg *judging) round(ctx context.Context, pend []pending, asks []pick, out []landing.Check) []pick {
 	n := jg.batch
 	if n <= 0 {
 		n = 8
 	}
-	var batches [][]ask
+	var batches [][]pick
 	for len(asks) > 0 {
 		b := asks[:min(n, len(asks))]
 		asks = asks[len(b):]
@@ -137,7 +178,7 @@ func (jg *judging) finish(ctx context.Context, pend []pending) []landing.Check {
 	call := func(k int) {
 		items := make([]decide.JudgeItem, len(batches[k]))
 		for i, a := range batches[k] {
-			items[i] = judgeItem(pend[a.i])
+			items[i] = judgeItem(pend[a.i], a.ruled)
 		}
 		replies[k].ans, replies[k].err = jg.call(ctx, items)
 	}
@@ -158,6 +199,7 @@ func (jg *judging) finish(ctx context.Context, pend []pending) []landing.Check {
 		}()
 	}
 	wg.Wait()
+	var picks []pick
 	for k, b := range batches {
 		ans, err := replies[k].ans, replies[k].err
 		byID := map[string]decide.JudgeAnswer{}
@@ -175,14 +217,143 @@ func (jg *judging) finish(ctx context.Context, pend []pending) []landing.Check {
 				jg.fail(&out[a.i], p, msg)
 				continue
 			}
-			if e := jg.st.PutJudgment(store.Judgment{Key: a.key, Record: r.Record, Replaced: r.Replaced, Why: r.Why}); e != nil {
-				jg.errs = append(jg.errs, "judgment cache: "+e.Error())
-			}
-			out[a.i] = landing.Finish(p.c, p.cands, r.Record, r.Replaced, "judge: "+r.Why)
+			a.ans, a.refused = r, -1
+			picks = append(picks, a)
 		}
 	}
-	return out
+	return picks
 }
+
+// pick is the judge's answer for pend[i], before it is stored.
+type pick struct {
+	i       int
+	key     string
+	ans     decide.JudgeAnswer
+	ruled   map[int]string // candidates refused in earlier rounds, with why
+	refused int            // this round's pick, refused by the check (-1: not refused)
+	failed  string         // the check of the pick failed: the row is ?
+}
+
+// verify checks every pick of a record in a call of its own. A pick the
+// check refuses, or whose quote is not in the record, becomes "no record"
+// and is marked refused, so the next round rules it out.
+// With no verifier (tests that do not check picks) picks stand as given.
+func (jg *judging) verify(ctx context.Context, pend []pending, picks []pick) {
+	if jg.v == nil {
+		return
+	}
+	var idx []int // picks to check
+	var items []decide.VerifyItem
+	for k, pk := range picks {
+		p, r := pend[pk.i], pk.ans.Record
+		if _, again := pk.ruled[r]; again || r < 0 || r >= len(p.cands) || p.cands[r].Kind == "decision" {
+			continue
+		}
+		e := p.cands[r]
+		idx = append(idx, k)
+		items = append(items, decide.VerifyItem{ID: p.c.Decision.ID, Decision: p.c.Decision.Summary,
+			Words: quote(p.c.Decision.Text, 600), Record: e.Kind + " " + e.Ref + " | " + e.Text})
+	}
+	ans := map[string]decide.VerifyAnswer{}
+	errOf := map[string]error{}
+	n := jg.batch
+	if n <= 0 {
+		n = 8
+	}
+	var mu sync.Mutex
+	run := func(b []decide.VerifyItem) {
+		jg.mu.Lock()
+		stopped := jg.stopped
+		jg.mu.Unlock()
+		var got []decide.VerifyAnswer
+		var err error
+		if stopped != nil {
+			err = stopped
+		} else {
+			got, err = jg.v.Verify(ctx, b)
+			jg.stop(err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		for _, a := range got {
+			ans[a.ID] = a
+		}
+		for _, it := range b {
+			if _, ok := ans[it.ID]; !ok {
+				errOf[it.ID] = err
+			}
+		}
+	}
+	var batches [][]decide.VerifyItem
+	for rest := items; len(rest) > 0; {
+		b := rest[:min(n, len(rest))]
+		rest = rest[len(b):]
+		batches = append(batches, b)
+	}
+	if len(batches) > 0 {
+		run(batches[0]) // proves the login before the rest start
+	}
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, judgeWorkers)
+	for _, b := range batches[min(1, len(batches)):] {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			run(b)
+		}()
+	}
+	wg.Wait()
+	for j, k := range idx {
+		pk := &picks[k]
+		a, ok := ans[items[j].ID]
+		switch {
+		case !ok:
+			pk.failed = "check of the judge's pick gave no answer"
+			if err := errOf[items[j].ID]; err != nil {
+				pk.failed = "check of the judge's pick failed: " + err.Error()
+			}
+		case !a.Records:
+			pk.refused = pk.ans.Record
+			pk.ans.Record, pk.ans.Why = -1, "pick refused: "+a.Why
+		case !quoted(a.Quote, items[j].Record):
+			pk.refused = pk.ans.Record
+			pk.ans.Record, pk.ans.Why = -1, "pick refused: its quote is not in the record"
+		}
+	}
+}
+
+// quoted reports whether quote stands in text: as written (case and spaces
+// aside), or with at least 80% of its words (3+ letters) found in text.
+func quoted(quote, text string) bool {
+	norm := func(s string) string { return strings.ToLower(strings.Join(strings.Fields(s), " ")) }
+	q := strings.Trim(norm(quote), " .,;:!?\"'“”‘’…")
+	if q == "" {
+		return false
+	}
+	t := norm(text)
+	if strings.Contains(t, q) {
+		return true
+	}
+	have := map[string]bool{}
+	for _, w := range wordRe.FindAllString(t, -1) {
+		have[w] = true
+	}
+	n, found := 0, 0
+	for _, w := range wordRe.FindAllString(q, -1) {
+		if len([]rune(w)) < 3 {
+			continue
+		}
+		n++
+		if have[w] {
+			found++
+		}
+	}
+	return n > 0 && found*5 >= n*4
+}
+
+var wordRe = regexp.MustCompile(`[\p{L}\p{N}_]+`)
 
 // judgeWorkers is how many judge calls run at once after the first.
 const judgeWorkers = 4
@@ -244,6 +415,9 @@ func (jg *judging) fail(c *landing.Check, p pending, msg string) {
 // classifier's errors (classifyErrs) stops it before its first call.
 func newJudging(st *store.Store, j decide.Judge, model string, classifyErrs []error) *judging {
 	jg := &judging{st: st, j: j, model: model}
+	if v, ok := j.(decide.Verifier); ok {
+		jg.v = v
+	}
 	for _, err := range classifyErrs {
 		if errors.Is(err, decide.ErrAPIKey) {
 			jg.stopped = err

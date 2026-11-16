@@ -137,3 +137,27 @@ func TestRelayTurnsAreNotOwner(t *testing.T) {
 		t.Errorf("injected = %d, want 9", len(s.Injected))
 	}
 }
+
+// landed's own SessionStart hook messages are kept as warnings, so a warning
+// shown before the live log existed can be rebuilt; other hooks are ignored.
+func TestParseWarnings(t *testing.T) {
+	s, err := ParseFile("testdata/warn.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Warnings) != 1 {
+		t.Fatalf("warnings = %+v, want 1", s.Warnings)
+	}
+	w := s.Warnings[0]
+	if !w.Time.Equal(time.Date(2026, 11, 2, 12, 0, 0, 0, time.UTC)) {
+		t.Errorf("warning time = %v", w.Time)
+	}
+	want := []string{"from now on the kettle settings live in TOML", `use "blue" lids…`}
+	if strings.Join(w.Lines, "|") != strings.Join(want, "|") {
+		t.Errorf("warning lines = %q, want %q", w.Lines, want)
+	}
+	// Every action names the session that ran it.
+	if len(s.Actions) != 2 || s.Actions[0].Session != "s-warn" || s.Actions[1].Session != "s-warn" {
+		t.Errorf("actions = %+v, want 2 with session s-warn", s.Actions)
+	}
+}

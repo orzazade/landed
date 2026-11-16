@@ -22,6 +22,7 @@ usage:
   landed missing [--since 48h] [--project X] [--grace 4h] [--all]   decisions with no landing: quote, session, project, age
   landed check --session ID | --hook   one session's lasting decisions with no landing yet
   landed report [--since 48h]   count lines for a daily report, with the rescued count (no rows)
+  landed proof [--since 30d] [--installed DATE]   what the warnings led to, and how often you repeat a decision, per week
   landed eval [--no-model] [-v]   recall and precision against the hand labels (~/.local/share/landed/labels.jsonl)
 `
 
@@ -50,6 +51,8 @@ func main() {
 		err = cmdReport(os.Args[2:])
 	case "check":
 		err = cmdCheck(os.Args[2:])
+	case "proof":
+		err = cmdProof(os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return

@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/orzazade/landed/internal/store"
 	"github.com/orzazade/landed/internal/transcript"
@@ -53,12 +55,15 @@ func TestRules(t *testing.T) {
 }
 
 type fakeModel struct {
+	mu      sync.Mutex
 	calls   int
 	answers map[string]Answer
 	err     error
 }
 
 func (f *fakeModel) Classify(_ context.Context, items []Item) ([]Answer, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls++
 	var out []Answer
 	for _, it := range items {
@@ -321,5 +326,59 @@ func TestParseJudgmentsReplaced(t *testing.T) {
 	got, err := parseJudgments(`[{"id":"a","record":-1,"replaced":1,"why":"w"},{"id":"b","record":-1,"why":"w"},{"id":"c","record":-1,"replaced":4,"why":"w"}]`, items)
 	if err == nil || len(got) != 2 || got[0].Replaced != 1 || got[1].Replaced != -1 {
 		t.Errorf("got %+v, %v; want a replaced by 1, b by -1, c refused", got, err)
+	}
+}
+
+// blockModel answers only once two calls are in flight at the same time.
+type blockModel struct {
+	mu      sync.Mutex
+	active  int
+	both    chan struct{}
+	once    sync.Once
+	maxSeen int
+}
+
+func (b *blockModel) Classify(ctx context.Context, items []Item) ([]Answer, error) {
+	b.mu.Lock()
+	b.active++
+	b.maxSeen = max(b.maxSeen, b.active)
+	if b.active == 2 {
+		b.once.Do(func() { close(b.both) })
+	}
+	b.mu.Unlock()
+	select {
+	case <-b.both:
+	case <-time.After(2 * time.Second):
+	}
+	b.mu.Lock()
+	b.active--
+	b.mu.Unlock()
+	var out []Answer
+	for _, it := range items {
+		out = append(out, Answer{ID: it.ID, Decision: false})
+	}
+	return out, nil
+}
+
+// After the first batch, model calls run side by side: a month of turns
+// is classified in minutes, not in one long line of calls.
+func TestFindBatchesInParallel(t *testing.T) {
+	st := openStore(t)
+	var turns []transcript.Turn
+	for _, id := range []string{"a", "b", "c", "d", "e"} {
+		turns = append(turns, transcript.Turn{UUID: id, Text: "maybe we paint the kettle in some shade we like"})
+	}
+	m := &blockModel{both: make(chan struct{})}
+	res, stats := Find(context.Background(), turns, st, m, 1)
+	if m.maxSeen < 2 {
+		t.Errorf("at most %d model calls at once; want batches after the first side by side", m.maxSeen)
+	}
+	for _, r := range res {
+		if !r.Known {
+			t.Errorf("%s unknown: %s", r.Turn.UUID, r.Err)
+		}
+	}
+	if len(stats.Errors) != 0 {
+		t.Errorf("errors %v", stats.Errors)
 	}
 }

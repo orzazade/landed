@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/orzazade/landed/internal/landing"
+	"github.com/orzazade/landed/internal/transcript"
 )
 
 // hookBudget is how long the hook may take; Claude Code's own timeout for it
@@ -48,6 +49,7 @@ func checkFlags() (fs *flag.FlagSet, o *checkOpts, since, grace, window *string,
 	hook = fs.Bool("hook", false, "Claude Code hook mode: session from stdin JSON, silent when nothing is missing, never fails")
 	warm = fs.Bool("warm", false, "with --hook: only start a background check of the session (for PreCompact)")
 	fs.BoolVar(&o.background, "background", false, "internal: the warm-up's own run (one per session, output dropped)")
+	fs.BoolVar(&o.shownHere, "shown-here", false, "the output is read inside the --session itself (/landed); the proof log then names it as the session warned")
 	return
 }
 
@@ -86,9 +88,23 @@ func cmdCheck(args []string) error {
 		return err
 	}
 	open := unlanded(c.Checks)
+	var shown []string
 	for _, ch := range open {
-		fmt.Printf("%-7s %q\n        why: %s\n", ch.State, quote(ch.Decision.Text, 100), quote(ch.Why, 200))
+		line := fmt.Sprintf("%-7s %q", ch.State, quote(ch.Decision.Text, 100))
+		fmt.Printf("%s\n        why: %s\n", line, quote(ch.Why, 200))
+		shown = append(shown, line)
 	}
+	logErr := c.ProofErr
+	if !o.background {
+		// A run from a terminal or another session shows the rows to no
+		// session: only /landed (--shown-here) warns the session it checks.
+		to := ""
+		if o.shownHere {
+			to = o.session
+		}
+		logErr = errors.Join(logWarns(proofPath(o), "check", to, open, shown, time.Now()), logErr)
+	}
+	sayNotRecorded(os.Stderr, logErr)
 	sup := 0
 	for _, ch := range c.Checks {
 		if ch.State == landing.Superseded {
@@ -150,17 +166,22 @@ func runHook(stdin io.Reader, stdout io.Writer, o checkOpts) error {
 	}
 	open := unlanded(c.Checks)
 	if len(open) == 0 {
+		sayNotRecorded(stdout, c.ProofErr) // nothing to warn, but a failed write is said
 		return nil
 	}
-	fmt.Fprintln(stdout, "Owner decisions in this session with no landing yet:")
+	fmt.Fprintln(stdout, transcript.WarnHeader)
+	var shown []string
 	for i, ch := range open {
 		if i == maxListed {
 			fmt.Fprintf(stdout, "- … and %d more (landed check --session %s)\n", len(open)-maxListed, o.session)
 			break
 		}
-		fmt.Fprintf(stdout, "- %q\n", quote(ch.Decision.Text, 160))
+		line := fmt.Sprintf("- %q", quote(ch.Decision.Text, 160))
+		fmt.Fprintln(stdout, line)
+		shown = append(shown, line)
 	}
 	fmt.Fprintln(stdout, "Land each before going on.")
+	sayNotRecorded(stdout, errors.Join(logWarns(proofPath(o), "hook", o.session, open[:len(shown)], shown, time.Now()), c.ProofErr))
 	return nil
 }
 

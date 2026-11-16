@@ -26,8 +26,11 @@ type checkOpts struct {
 	db, bus              string
 	roots, notes         rootList
 	reposUnder           string
-	session              string // only this session's turns ("" for all)
-	background           bool   // a warm-up whose rows nobody sees
+	session              string          // only this session's turns ("" for all)
+	background           bool            // a warm-up whose rows nobody sees (proof runs as one too: it shows no row to act on)
+	shownHere            bool            // check: the output is read inside the session it checks (/landed)
+	only                 map[string]bool // only these turns (nil for all)
+	pre                  *loaded         // transcripts already read since the same cut (nil: read them)
 }
 
 func (o *checkOpts) flags(fs *flag.FlagSet) (since, grace, window *string) {
@@ -70,6 +73,7 @@ type checked struct {
 	Projects    map[string]string // session id -> project name
 	// Rescued decisions: shown missing by a run, found landed by a later one.
 	RescuedWeek, RescuedAll int
+	ProofErr                error // writing the live log failed (said in one line, never fails the run)
 }
 
 func runChecks(ctx context.Context, o checkOpts, now time.Time) (checked, error) {
@@ -82,7 +86,12 @@ func runChecks(ctx context.Context, o checkOpts, now time.Time) (checked, error)
 		}
 		cut = first
 	}
-	l := loadCtx(ctx, o.roots, cut)
+	var l loaded
+	if o.pre != nil {
+		l = *o.pre
+	} else {
+		l = loadCtx(ctx, o.roots, cut)
+	}
 	out.Loaded = l
 	out.Projects = map[string]string{}
 	var turns []transcript.Turn
@@ -92,7 +101,7 @@ func runChecks(ctx context.Context, o checkOpts, now time.Time) (checked, error)
 			continue
 		}
 		for _, t := range s.Turns {
-			if t.Time.Before(cut) || (o.session != "" && t.SessionID != o.session) {
+			if t.Time.Before(cut) || (o.session != "" && t.SessionID != o.session) || (o.only != nil && !o.only[t.UUID]) {
 				continue
 			}
 			turns = append(turns, t)
@@ -128,6 +137,7 @@ func runChecks(ctx context.Context, o checkOpts, now time.Time) (checked, error)
 		out.Projects[s.ID] = s.Project
 	}
 	out.Stats.Errors = append(out.Stats.Errors, remember(st, o, out.Checks, now)...)
+	out.ProofErr = recordLandings(proofPath(o), out.Checks, src.Actions, now)
 	var err2 error
 	if out.RescuedWeek, out.RescuedAll, err2 = st.Rescued(now.Add(-7 * 24 * time.Hour)); err2 != nil {
 		out.Stats.Errors = append(out.Stats.Errors, err2)
@@ -230,13 +240,19 @@ func cmdMissing(args []string) error {
 		return err
 	}
 	counts := map[landing.State]int{}
+	var warned []landing.Check
+	var shown []string
 	for _, ch := range c.Checks {
 		counts[ch.State]++
 		if ch.State == landing.Landed && !*all {
 			continue
 		}
 		d := ch.Decision
-		fmt.Printf("%-10s %4s  %-14s %s  %q\n", ch.State, age(now, d.Time), quote(c.Projects[d.Session], 14), short(d.Session), quote(d.Text, 100))
+		line := fmt.Sprintf("%-10s %4s  %-14s %s  %q", ch.State, age(now, d.Time), quote(c.Projects[d.Session], 14), short(d.Session), quote(d.Text, 100))
+		fmt.Println(line)
+		if ch.State == landing.Missing || ch.State == landing.Unknown {
+			warned, shown = append(warned, ch), append(shown, line)
+		}
 		if d.Summary != "" {
 			fmt.Printf("        decision: %s\n", d.Summary)
 		}
@@ -271,6 +287,7 @@ func cmdMissing(args []string) error {
 	for _, e := range c.JudgeErrors {
 		fmt.Fprintln(os.Stderr, "judge error:", e)
 	}
+	sayNotRecorded(os.Stderr, errors.Join(logWarns(proofPath(o), "missing", "", warned, shown, now), c.ProofErr))
 	return runErrors(c, c.Loaded.report())
 }
 

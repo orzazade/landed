@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -33,7 +35,18 @@ func cmdReport(args []string) error {
 		return err
 	}
 	readErr := c.Loaded.report()
-	writeReport(os.Stdout, c, *since, *grace, readErr)
+	var buf bytes.Buffer
+	writeReport(&buf, c, *since, *grace, readErr)
+	// The report shows counts, not rows: each row counted as unlanded is
+	// logged with the count line as what was shown.
+	first, _, _ := strings.Cut(buf.String(), "\n")
+	open := unlanded(c.Checks)
+	shown := make([]string, len(open))
+	for i := range shown {
+		shown[i] = first
+	}
+	sayNotRecorded(&buf, errors.Join(logWarns(proofPath(o), "report", "", open, shown, now), c.ProofErr))
+	os.Stdout.Write(buf.Bytes())
 	return runErrors(c, readErr)
 }
 
