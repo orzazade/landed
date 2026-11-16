@@ -107,7 +107,10 @@ sharing two keyword words), before and after the install date (`--installed`; de
 first warning). Each week shows three examples with session ids, so you can check the count.
 Earlier decisions are looked for up to 30 days back, also before `--since`; a week with less
 history behind it is marked `*`, because its count is low. The rate leaves out decisions whose
-model call failed, and says how many there were.
+model call failed, and says how many there were. One message sent to several tabs counts once:
+a decision in another session within 10 minutes of an earlier one, close in length and with at
+least 80% of the same words, is left out and counted apart. A message pasted again into the same
+tab still counts.
 
 ## What counts as a decision
 

@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,6 +34,7 @@ type repeat struct {
 type repeats struct {
 	Found         map[string]repeat // by later decision id
 	Failed        map[string]bool   // later decisions whose answer failed
+	Copies        map[string]bool   // later copies of one message sent to several tabs: never counted
 	Asked, Cached int
 	Errs          []string
 }
@@ -39,12 +42,79 @@ type repeats struct {
 const (
 	repeatGap  = time.Hour           // closer than this is the same exchange, not a restatement
 	repeatSpan = 30 * 24 * time.Hour // how far back an earlier decision is looked for
+	copySpan   = 10 * time.Minute    // copies of one message to several tabs are sent within this
 	maxEarlier = 5
 )
 
+// copiesOf finds messages sent to several tabs: a decision in another
+// session within copySpan of an earlier kept one at or after from, with
+// nearly the same words. The first copy is kept; the rest are returned. A
+// decision that nearly matches one already in its own session is a message
+// pasted again there, and always counts. Decisions must be sorted by time.
+func copiesOf(decs []repeatDec, from time.Time) map[string]bool {
+	out := map[string]bool{}
+	words := make([]map[string]bool, len(decs))
+	for i, d := range decs {
+		words[i] = wordSet(d.Text)
+	}
+	for i, d := range decs {
+		if d.Time.Before(from) {
+			continue
+		}
+		copyOf, again := false, false
+		for j := i - 1; j >= 0 && d.Time.Sub(decs[j].Time) <= copySpan; j-- {
+			e := decs[j]
+			if !nearlySame(words[i], words[j]) {
+				continue
+			}
+			if e.Session == d.Session {
+				again = true
+				break
+			}
+			if !out[e.ID] && !e.Time.Before(from) {
+				copyOf = true
+			}
+		}
+		if copyOf && !again {
+			out[d.ID] = true
+		}
+	}
+	return out
+}
+
+var copyWordRe = regexp.MustCompile(`[\p{L}\p{N}]{3,}`)
+
+func wordSet(s string) map[string]bool {
+	out := map[string]bool{}
+	for _, w := range copyWordRe.FindAllString(strings.ToLower(s), -1) {
+		out[w] = true
+	}
+	return out
+}
+
+// nearlySame: at least 4 words each, close in length (the shorter has 60%
+// of the longer one's words), and 80% of the shorter one's words are in the
+// other.
+func nearlySame(a, b map[string]bool) bool {
+	if len(a) > len(b) {
+		a, b = b, a
+	}
+	if len(a) < 4 || len(a)*5 < len(b)*3 {
+		return false
+	}
+	n := 0
+	for w := range a {
+		if b[w] {
+			n++
+		}
+	}
+	return n*5 >= len(a)*4
+}
+
 // earlierOf offers, for each decision, the earlier decisions that share at
 // least two keyword words with it, at least repeatGap older: most shared
-// words first, then the newest.
+// words first, then the newest. Copies to other tabs are offered too: a copy
+// may hold words its first copy lacks.
 func earlierOf(decs []repeatDec) map[int][]int {
 	out := map[int][]int{}
 	for i, d := range decs {
@@ -87,7 +157,7 @@ func restateKey(model string, d repeatDec, earlier []repeatDec) string {
 // are only looked back at. Answers are cached in the store. decs must be
 // sorted by time.
 func findRepeats(ctx context.Context, decs []repeatDec, from time.Time, st *store.Store, r decide.Restater, model string) repeats {
-	rs := repeats{Found: map[string]repeat{}, Failed: map[string]bool{}}
+	rs := repeats{Found: map[string]repeat{}, Failed: map[string]bool{}, Copies: copiesOf(decs, from)}
 	cands := earlierOf(decs)
 	type ask struct {
 		i   int
@@ -97,7 +167,7 @@ func findRepeats(ctx context.Context, decs []repeatDec, from time.Time, st *stor
 	var asks []ask
 	for i, d := range decs {
 		js := cands[i]
-		if len(js) == 0 || d.Time.Before(from) {
+		if len(js) == 0 || d.Time.Before(from) || rs.Copies[d.ID] {
 			continue
 		}
 		var earlier []repeatDec
@@ -193,6 +263,7 @@ type weekRow struct {
 	After              bool // after landed was installed
 	Decisions, Repeats int
 	Failed             int
+	Copies             int // left out: later copies of a message sent to several tabs
 	Examples           []repeat
 }
 
@@ -221,6 +292,10 @@ func weekly(decs []repeatDec, from time.Time, rs repeats, installed time.Time, l
 		if r == nil {
 			r = &weekRow{Start: k.start, After: k.after}
 			rows[k] = r
+		}
+		if rs.Copies[d.ID] {
+			r.Copies++
+			continue
 		}
 		r.Decisions++
 		if rs.Failed[d.ID] {
@@ -275,6 +350,12 @@ func writeRepeats(w io.Writer, rows []weekRow, rs repeats, installed, oldest tim
 	for i, side := range []string{"before", "after"} {
 		fmt.Fprintf(w, "  %s install: %d of %d checked lasting decisions were repeats (%.1f%%); %d more could not be checked\n", side, tot[i][1], tot[i][0]-tot[i][2], pct(tot[i][1], tot[i][0]-tot[i][2]), tot[i][2])
 	}
+	copies := 0
+	for _, r := range rows {
+		copies += r.Copies
+	}
+	fmt.Fprintf(w, "  %d %s of a message sent to several tabs left out (same words within %v, other session; the first copy counts)\n",
+		copies, map[bool]string{true: "copy", false: "copies"}[copies == 1], copySpan)
 	fmt.Fprintf(w, "  model answers: %d cached, %d asked\n", rs.Cached, rs.Asked)
 	for _, r := range rows {
 		if len(r.Examples) == 0 {

@@ -133,3 +133,109 @@ func TestRepeatRateLeavesOutFailed(t *testing.T) {
 		t.Errorf("want 1 of 2 checked (50%%):\n%s", s)
 	}
 }
+
+// One message sent to two tabs is one message. Shaped on a real case (made-up
+// words): the owner sent an order to two tabs 3 seconds apart, the second copy
+// with a note added and one agent name changed, and both copies restate an
+// older rule. That is one repeat out of one decision, not two of two.
+func TestBroadcastCountsOnce(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "l.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	at := time.Date(2026, 11, 14, 17, 31, 20, 0, time.UTC)
+	decs := []repeatDec{
+		{ID: "old", Session: "s0", Time: time.Date(2026, 10, 29, 1, 53, 0, 0, time.UTC),
+			Text: "Kettle order: every boil test runs through the shared kettle slot, one at a time", Summary: "one boil test at a time", Keywords: []string{"boil", "kettle", "slot"}},
+		{ID: "tab1", Session: "s1", Time: at,
+			Text:    "Kettle limit: 15-min heat 30, 5-min 50 (steam vent ~5 holes; boil tests run on top). Until I lift it: one boil test at a time across kettles, 2 burners. Agree the order with spout and lid. I lift it when the 15-min heat is under 28.",
+			Summary: "one boil test at a time", Keywords: []string{"boil", "kettle", "slot"}},
+		{ID: "tab2", Session: "s2", Time: at.Add(3 * time.Second),
+			Text:    "Kettle limit: 15-min heat 30, 5-min 50. Until I lift it: one boil test at a time across kettles, 2 burners. Agree the order with handle and lid. I lift it when the 15-min heat is under 28.",
+			Summary: "one boil test at a time", Keywords: []string{"boil", "kettle", "slot"}},
+	}
+	fr := &fakeRestater{pick: map[string]int{"tab1": 0, "tab2": 0}}
+	rs := findRepeats(context.Background(), decs, time.Time{}, st, fr, "haiku")
+	installed := time.Date(2026, 11, 14, 15, 8, 0, 0, time.UTC)
+	var after weekRow
+	for _, r := range weekly(decs, time.Time{}, rs, installed, time.UTC) {
+		if r.After {
+			after = r
+		}
+	}
+	if after.Decisions != 1 || after.Repeats != 1 {
+		t.Errorf("after install: %d repeats of %d decisions, want 1 of 1 (two tabs, one message)", after.Repeats, after.Decisions)
+	}
+	var out bytes.Buffer
+	writeRepeats(&out, weekly(decs, time.Time{}, rs, installed, time.UTC), rs, installed, decs[0].Time)
+	if !strings.Contains(out.String(), "1 copy of a message sent to several tabs left out") {
+		t.Errorf("output does not say a copy was left out:\n%s", out.String())
+	}
+}
+
+// Only a copy to another tab within copySpan, with nearly the same words, is
+// left out. A message pasted again into the same tab stays: the owner said it
+// twice there.
+func TestCopiesOf(t *testing.T) {
+	at := time.Date(2026, 11, 14, 17, 31, 0, 0, time.UTC)
+	msg := "Kettle limit: one boil test at a time across kettles, two burners, agree the order with lid"
+	cases := []struct {
+		name string
+		b    repeatDec
+		copy bool
+	}{
+		{"other tab, same minute", repeatDec{ID: "b", Session: "s2", Time: at.Add(3 * time.Second), Text: msg}, true},
+		{"same tab, pasted again", repeatDec{ID: "b", Session: "s1", Time: at.Add(3 * time.Second), Text: msg}, false},
+		{"other tab, 11 minutes later", repeatDec{ID: "b", Session: "s2", Time: at.Add(11 * time.Minute), Text: msg}, false},
+		{"other tab, other words", repeatDec{ID: "b", Session: "s2", Time: at.Add(time.Minute), Text: "the spout stays ceramic, never steel, for every kettle model"}, false},
+		{"too few words", repeatDec{ID: "b", Session: "s2", Time: at.Add(time.Minute), Text: "yes, go"}, false},
+	}
+	for _, c := range cases {
+		a := repeatDec{ID: "a", Session: "s1", Time: at, Text: msg}
+		if c.name == "too few words" {
+			a.Text = "yes, go"
+		}
+		got := copiesOf([]repeatDec{a, c.b}, time.Time{})
+		if got["b"] != c.copy || got["a"] {
+			t.Errorf("%s: copies %v, want b copy=%v", c.name, got, c.copy)
+		}
+	}
+}
+
+// Review cases: a short message is not a copy of a long, different one;
+// a re-paste into a tab that got a copy still counts; a copy whose first
+// copy is before the window counts (the first one is never counted).
+func TestCopiesOfEdges(t *testing.T) {
+	at := time.Date(2026, 11, 14, 17, 31, 0, 0, time.UTC)
+	msg := "Kettle limit: one boil test at a time across kettles, two burners, agree the order with lid"
+	short := repeatDec{ID: "a", Session: "s1", Time: at, Text: "Run the boil tests before every kettle ships, always."}
+	long := repeatDec{ID: "b", Session: "s2", Time: at.Add(5 * time.Minute), Text: "Ship through the spout line only, never by hand; run the boil tests before every kettle ships, always; pin the lid sizes and log each burner."}
+	if got := copiesOf([]repeatDec{short, long}, time.Time{}); got["b"] {
+		t.Error("a long, different message was taken for a copy of a short one")
+	}
+	a := repeatDec{ID: "a", Session: "s1", Time: at, Text: msg}
+	b := repeatDec{ID: "b", Session: "s2", Time: at.Add(3 * time.Second), Text: msg}
+	d := repeatDec{ID: "d", Session: "s2", Time: at.Add(5 * time.Minute), Text: msg}
+	if got := copiesOf([]repeatDec{a, b, d}, time.Time{}); !got["b"] || got["d"] {
+		t.Errorf("copies %v; want b a copy, d (pasted again into s2) counted", got)
+	}
+	if got := copiesOf([]repeatDec{a, b}, at.Add(time.Second)); got["b"] {
+		t.Error("b's first copy is before the window: b must count")
+	}
+}
+
+// A copy is still an earlier decision a later one can restate: when the
+// later copy holds the extra words, the restatement is found through it.
+func TestCopyIsStillAnEarlierCandidate(t *testing.T) {
+	at := time.Date(2026, 11, 2, 9, 0, 0, 0, time.UTC)
+	decs := []repeatDec{
+		{ID: "a", Session: "s1", Time: at, Text: "Kettle limit: one boil test at a time across kettles, two burners, agree the order with lid", Keywords: []string{"boil", "kettle"}},
+		{ID: "b", Session: "s2", Time: at.Add(3 * time.Second), Text: "Kettle limit: one boil test at a time across kettles, two burners, agree the order with lid (descale weekly)", Keywords: []string{"boil", "kettle"}},
+	}
+	later := repeatDec{ID: "c", Session: "s3", Time: at.Add(48 * time.Hour), Text: "again: descale weekly", Keywords: []string{"descale", "weekly"}}
+	got := earlierOf(append(decs, later))
+	if len(got[2]) != 1 || got[2][0] != 1 {
+		t.Errorf("earlier candidates of c: %v, want [1] (the copy with the extra words)", got[2])
+	}
+}
