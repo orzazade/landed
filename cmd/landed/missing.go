@@ -188,6 +188,7 @@ func widen(src *landing.Sources, root string, judged bool) {
 		if src.ReposErr != nil {
 			fmt.Fprintln(os.Stderr, "repos:", src.ReposErr)
 		}
+		src.PrefetchCommits()
 	}
 	src.ChangedNotes, src.AllBus = true, true
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -111,13 +112,14 @@ func TestFindRulesModelAndCache(t *testing.T) {
 	if res[0].Verdict.Summary != "lid sensor required before shipping" {
 		t.Errorf("rule decision lost the model's summary: %+v", res[0].Verdict)
 	}
-	if m.calls != 1 || stats.ByModel != 2 || stats.ByRule != 2 {
-		t.Errorf("calls=%d byModel=%d byRule=%d", m.calls, stats.ByModel, stats.ByRule)
+	first := m.calls
+	if first == 0 || stats.ByModel != 2 || stats.ByRule != 2 {
+		t.Errorf("calls=%d byModel=%d byRule=%d", first, stats.ByModel, stats.ByRule)
 	}
 	// Second run: everything comes from the cache, the model is not called.
 	_, stats2 := Find(context.Background(), turns, st, m, 10)
-	if m.calls != 1 || stats2.Cached != 4 {
-		t.Errorf("second run: calls=%d cached=%d", m.calls, stats2.Cached)
+	if m.calls != first || stats2.Cached != 4 {
+		t.Errorf("second run: calls=%d (first run %d) cached=%d", m.calls, first, stats2.Cached)
 	}
 }
 
@@ -262,21 +264,24 @@ func TestParseJudgmentsRefusesBadIndex(t *testing.T) {
 func TestFindStopsAtAPIKeyRefusal(t *testing.T) {
 	st := openStore(t)
 	var turns []transcript.Turn
-	for _, id := range []string{"a", "b", "c", "d"} {
-		turns = append(turns, transcript.Turn{UUID: id, Text: "maybe we paint the kettle in some shade we like"})
+	// Calls run side by side (ClaudeCLI proves the login once before any of
+	// them, see the probe tests): after a refusal, no call starts beyond
+	// those already running, one per worker.
+	for i := range 3 * modelWorkers {
+		turns = append(turns, transcript.Turn{UUID: fmt.Sprint("t", i), Text: "maybe we paint the kettle in some shade we like"})
 	}
 	m := &fakeModel{err: fmt.Errorf("%w (apiKeySource %q)", ErrAPIKey, "ANTHROPIC_API_KEY")}
 	res, stats := Find(context.Background(), turns, st, m, 1)
-	if m.calls != 1 {
-		t.Errorf("model called %d times after an API-key refusal; want 1", m.calls)
+	if m.calls > modelWorkers {
+		t.Errorf("model called %d times after an API-key refusal; want at most one per worker (%d)", m.calls, modelWorkers)
 	}
 	for _, r := range res {
 		if r.Known {
 			t.Errorf("%s known after refusal", r.Turn.UUID)
 		}
 	}
-	if len(stats.Errors) != 4 {
-		t.Errorf("errors %d, want one per batch (4)", len(stats.Errors))
+	if len(stats.Errors) != len(turns) {
+		t.Errorf("errors %d, want one per batch (%d)", len(stats.Errors), len(turns))
 	}
 }
 
@@ -372,6 +377,64 @@ func TestFindBatchesInParallel(t *testing.T) {
 	res, stats := Find(context.Background(), turns, st, m, 1)
 	if m.maxSeen < 2 {
 		t.Errorf("at most %d model calls at once; want batches after the first side by side", m.maxSeen)
+	}
+	for _, r := range res {
+		if !r.Known {
+			t.Errorf("%s unknown: %s", r.Turn.UUID, r.Err)
+		}
+	}
+	if len(stats.Errors) != 0 {
+		t.Errorf("errors %v", stats.Errors)
+	}
+}
+
+// barrierModel holds each call until want calls are in flight (or 2 s pass),
+// and records how many items each call carried.
+type barrierModel struct {
+	want    int
+	mu      sync.Mutex
+	active  int
+	maxSeen int
+	sizes   []int
+	all     chan struct{}
+	once    sync.Once
+}
+
+func (b *barrierModel) Classify(ctx context.Context, items []Item) ([]Answer, error) {
+	b.mu.Lock()
+	b.active++
+	b.maxSeen = max(b.maxSeen, b.active)
+	b.sizes = append(b.sizes, len(items))
+	if b.active == b.want {
+		b.once.Do(func() { close(b.all) })
+	}
+	b.mu.Unlock()
+	select {
+	case <-b.all:
+	case <-time.After(2 * time.Second):
+	}
+	b.mu.Lock()
+	b.active--
+	b.mu.Unlock()
+	var out []Answer
+	for _, it := range items {
+		out = append(out, Answer{ID: it.ID, Decision: false})
+	}
+	return out, nil
+}
+
+// A cold run's new turns are spread over every worker at once, none alone:
+// 20 turns are 7 calls of at most 3 side by side, not one call of 20.
+func TestFindSpreadsTurnsOverWorkers(t *testing.T) {
+	st := openStore(t)
+	var turns []transcript.Turn
+	for i := range 20 {
+		turns = append(turns, transcript.Turn{UUID: fmt.Sprint("t", i), Text: "maybe we paint the kettle in some shade we like"})
+	}
+	m := &barrierModel{want: 7, all: make(chan struct{})}
+	res, stats := Find(context.Background(), turns, st, m, 25)
+	if len(m.sizes) != 7 || m.maxSeen != 7 || slices.Max(m.sizes) != 3 {
+		t.Errorf("calls with %v items, at most %d at once; want 7 calls of at most 3, all at once", m.sizes, m.maxSeen)
 	}
 	for _, r := range res {
 		if !r.Known {

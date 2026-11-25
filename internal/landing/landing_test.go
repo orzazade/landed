@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -566,5 +567,35 @@ func TestLateSessionActionIsACandidate(t *testing.T) {
 	}
 	if !strings.Contains(cands[i].Text, "docker volume rm") {
 		t.Errorf("the judge does not see the matching line: %q", cands[i].Text)
+	}
+}
+
+// Commits read ahead, several repos at once, are the same candidates Gather
+// finds by reading each repo itself, and Gather runs no git log after them.
+func TestPrefetchedCommitsAreTheSame(t *testing.T) {
+	t0 := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
+	var repos []string
+	for i := range 12 {
+		r := t.TempDir()
+		git(t, r, nil, "init", "-q")
+		git(t, r, nil, "config", "user.email", "dev@example.invalid")
+		git(t, r, nil, "config", "user.name", "dev")
+		commitAt(t, r, t0.Add(time.Duration(i+1)*time.Minute), "dial.go", "package ui\n", fmt.Sprintf("temperature dial %d shows celsius", i))
+		repos = append(repos, r)
+	}
+	d := Decision{ID: "a", Time: t0, Keywords: []string{"temperature dial", "celsius"}}
+	mk := func() *Sources {
+		return &Sources{Window: 7 * 24 * time.Hour, Now: t0.Add(48 * time.Hour), Since: t0.Add(-time.Hour), Repos: repos}
+	}
+	_, want := mk().Gather(d)
+	if len(want) != len(repos) {
+		t.Fatalf("control: %d candidates, want one commit per repo (%d)", len(want), len(repos))
+	}
+	src := mk()
+	src.PrefetchCommits()
+	src.Git = filepath.Join(t.TempDir(), "no-git") // any git log now would fail
+	_, got := src.Gather(d)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("prefetched candidates differ:\n got %+v\nwant %+v", got, want)
 	}
 }

@@ -7,6 +7,8 @@ import (
 	"strings"
 )
 
+// verifyPrompt: cached checks are keyed by JudgeVersion, so an edit here
+// means bumping JudgeVersion.
 const verifyPrompt = `You check one claim per item: that a record made after a developer's decision (a git commit, a note or status file edit, a coordination-bus line, or an action the agent took) states or carries out THAT decision. Each item has the decision ("decision": a one-line summary, "words": what the developer typed) and the one record ("record"). Answer "records": true only when the record states the same specific choice or does the decided work. Answer false when the record states a different or opposite choice on the same topic, only describes the topic or the current setup, recommends something else, is research or a draft for later, or belongs to another project or task. When true, copy into "quote" the exact words of the record (max 25 words) that state the choice or do the work; when false, "quote" is "".
 Reply with ONLY a JSON array, one object per item, in input order, no backslashes: [{"id":"...","records":true|false,"quote":"...","why":"<max 12 words>"}]`
 

@@ -29,7 +29,7 @@ type judging struct {
 	j             decide.Judge
 	v             decide.Verifier // checks each pick on its own; nil: picks stand
 	model         string          // part of the cache key
-	batch         int             // decisions per call; 0: 8
+	batch         int             // decisions per call; 0: spread over the workers, at most 8
 	errs          []string
 	cached, asked int
 	reused        int   // landed outcomes reused from earlier runs
@@ -44,6 +44,13 @@ func judgeKey(p pending, model string) string {
 	for _, e := range p.cands { // everything the judge reads
 		fmt.Fprintf(h, "%s\x00%s\x00%s\x00%s\x00", e.Kind, e.Ref, e.When.UTC(), e.Text)
 	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// checkKey names a check of one pick: everything the check reads.
+func checkKey(it decide.VerifyItem, model string) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%s\x00%s\x00%s\x00%s\x00%s\x00%s", decide.JudgeVersion, model, it.ID, it.Decision, it.Words, it.Record)
 	return hex.EncodeToString(h.Sum(nil))
 }
 
@@ -160,10 +167,7 @@ func (jg *judging) finish(ctx context.Context, pend []pending) []landing.Check {
 // round asks the judge about every ask, in batches; a decision the judge
 // does not answer becomes ? in out.
 func (jg *judging) round(ctx context.Context, pend []pending, asks []pick, out []landing.Check) []pick {
-	n := jg.batch
-	if n <= 0 {
-		n = 8
-	}
+	n := jg.perCall(len(asks))
 	var batches [][]pick
 	for len(asks) > 0 {
 		b := asks[:min(n, len(asks))]
@@ -182,14 +186,10 @@ func (jg *judging) round(ctx context.Context, pend []pending, asks []pick, out [
 		}
 		replies[k].ans, replies[k].err = jg.call(ctx, items)
 	}
-	// The first batch goes alone: it proves the login before any other call
-	// starts. The rest run a few at a time.
-	if len(batches) > 0 {
-		call(0)
-	}
+	// All batches run side by side (the judge proves the login once before).
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, judgeWorkers)
-	for k := 1; k < len(batches); k++ {
+	for k := range batches {
 		wg.Add(1)
 		sem <- struct{}{}
 		go func() {
@@ -254,12 +254,23 @@ func (jg *judging) verify(ctx context.Context, pend []pending, picks []pick) {
 		items = append(items, decide.VerifyItem{ID: p.c.Decision.ID, Decision: p.c.Decision.Summary,
 			Words: quote(p.c.Decision.Text, 600), Record: e.Kind + " " + e.Ref + " | " + e.Text})
 	}
+	// A check reads only the decision and the picked record: one asked
+	// before (in this run or an earlier one) is answered from the cache.
 	ans := map[string]decide.VerifyAnswer{}
 	errOf := map[string]error{}
-	n := jg.batch
-	if n <= 0 {
-		n = 8
+	var ask []decide.VerifyItem
+	for _, it := range items {
+		c, ok, err := jg.st.PickCheck(checkKey(it, jg.model))
+		if err != nil {
+			jg.errs = append(jg.errs, "check cache: "+err.Error()) // loud, then asked as usual
+		}
+		if ok {
+			ans[it.ID] = decide.VerifyAnswer{ID: it.ID, Records: c.Records, Quote: c.Quote, Why: c.Why}
+			continue
+		}
+		ask = append(ask, it)
 	}
+	n := jg.perCall(len(ask))
 	var mu sync.Mutex
 	run := func(b []decide.VerifyItem) {
 		jg.mu.Lock()
@@ -285,17 +296,14 @@ func (jg *judging) verify(ctx context.Context, pend []pending, picks []pick) {
 		}
 	}
 	var batches [][]decide.VerifyItem
-	for rest := items; len(rest) > 0; {
+	for rest := ask; len(rest) > 0; {
 		b := rest[:min(n, len(rest))]
 		rest = rest[len(b):]
 		batches = append(batches, b)
 	}
-	if len(batches) > 0 {
-		run(batches[0]) // proves the login before the rest start
-	}
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, judgeWorkers)
-	for _, b := range batches[min(1, len(batches)):] {
+	for _, b := range batches {
 		wg.Add(1)
 		sem <- struct{}{}
 		go func() {
@@ -305,6 +313,13 @@ func (jg *judging) verify(ctx context.Context, pend []pending, picks []pick) {
 		}()
 	}
 	wg.Wait()
+	for _, it := range ask {
+		if a, ok := ans[it.ID]; ok {
+			if err := jg.st.PutPickCheck(store.PickCheck{Key: checkKey(it, jg.model), Records: a.Records, Quote: a.Quote, Why: a.Why}); err != nil {
+				jg.errs = append(jg.errs, "check cache: "+err.Error())
+			}
+		}
+	}
 	for j, k := range idx {
 		pk := &picks[k]
 		a, ok := ans[items[j].ID]
@@ -355,8 +370,19 @@ func quoted(quote, text string) bool {
 
 var wordRe = regexp.MustCompile(`[\p{L}\p{N}_]+`)
 
-// judgeWorkers is how many judge calls run at once after the first.
-const judgeWorkers = 4
+// judgeWorkers is how many judge calls run at once.
+const judgeWorkers = 8
+
+// perCall is how many of n decisions go in one judge or check call: the set
+// batch, else spread over the workers, at most 8 a call. A decision carries
+// dozens of candidates, so up to judgeWorkers decisions each get a call of
+// their own.
+func (jg *judging) perCall(n int) int {
+	if jg.batch > 0 {
+		return jg.batch
+	}
+	return decide.PerCall(n, 1, 8, judgeWorkers)
+}
 
 // call asks the judge about one batch, and once more for the items it skipped
 // or could not parse. After an API-key refusal nothing is called again.
@@ -386,6 +412,10 @@ func (jg *judging) call(ctx context.Context, items []decide.JudgeItem) ([]decide
 		return ans, err // every item answered: no second call
 	}
 	jg.mu.Lock()
+	if jg.stopped != nil { // another call found an API key meanwhile
+		jg.mu.Unlock()
+		return ans, jg.stopped
+	}
 	jg.asked += len(again)
 	jg.mu.Unlock()
 	more, err2 := jg.j.Judge(ctx, again)

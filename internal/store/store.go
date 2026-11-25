@@ -83,6 +83,13 @@ func Open(path string) (*Store, error) {
 		replaced INTEGER NOT NULL DEFAULT -1,
 		why    TEXT NOT NULL,
 		at     TEXT NOT NULL
+	);
+	CREATE TABLE IF NOT EXISTS pick_check (
+		key     TEXT PRIMARY KEY,
+		records INTEGER NOT NULL,
+		quote   TEXT NOT NULL,
+		why     TEXT NOT NULL,
+		at      TEXT NOT NULL
 	)`)
 	if err == nil {
 		err = addColumn(db, "verdict", "kind", `TEXT NOT NULL DEFAULT ''`)
@@ -206,6 +213,31 @@ func (s *Store) Judgment(key string) (Judgment, bool, error) {
 func (s *Store) PutJudgment(j Judgment) error {
 	_, err := s.db.Exec(`INSERT OR REPLACE INTO judgment (key, record, replaced, why, at) VALUES (?,?,?,?,?)`,
 		j.Key, j.Record, j.Replaced, j.Why, time.Now().UTC().Format(time.RFC3339))
+	return err
+}
+
+// PickCheck is the cached answer of a check of one judge pick.
+type PickCheck struct {
+	Key     string
+	Records bool
+	Quote   string
+	Why     string
+}
+
+// PickCheck returns the cached check stored under key, if there is one.
+func (s *Store) PickCheck(key string) (PickCheck, bool, error) {
+	c := PickCheck{Key: key}
+	err := s.db.QueryRow(`SELECT records, quote, why FROM pick_check WHERE key=?`, key).Scan(&c.Records, &c.Quote, &c.Why)
+	if errors.Is(err, sql.ErrNoRows) {
+		return c, false, nil
+	}
+	return c, err == nil, err
+}
+
+// PutPickCheck stores a check's answer.
+func (s *Store) PutPickCheck(c PickCheck) error {
+	_, err := s.db.Exec(`INSERT OR REPLACE INTO pick_check (key, records, quote, why, at) VALUES (?,?,?,?,?)`,
+		c.Key, c.Records, c.Quote, c.Why, time.Now().UTC().Format(time.RFC3339))
 	return err
 }
 

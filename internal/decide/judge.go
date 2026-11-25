@@ -7,7 +7,8 @@ import (
 	"strings"
 )
 
-// JudgeVersion is part of every cached judgment's key.
+// JudgeVersion is part of every cached judgment's and pick check's key:
+// changing the judge or the check prompt (verify.go) means bumping it.
 const JudgeVersion = "j8" // j7: each pick is checked on its own (Verify); j8: a refused pick is ruled out and judged again
 
 const judgePrompt = `You check whether a solo developer's decision, made in a chat with an AI coding agent, was written down or carried out afterwards. Each item has the decision ("decision": a one-line summary, "words": what the developer typed) and numbered candidate records made after it: git commits, edits of notes or status files, and coordination-bus lines. Pick the candidate that records or carries out THIS decision: the same specific choice, rule or piece of work, not just the same topic or project. A commit that implements the decided work counts; a status note or bus line counts only when it states the decided choice itself (what will or must be done, or what was dropped). Text that only describes the current setup, lists the topic, or recommends something else does not count. Candidates of kind "acted" are what the agent did right after the decision (commands, file edits): pick one when it carries the decision out (does the decided work, applies the setting, files the ticket), not when it only reads, searches or asks. If no candidate does, answer -1.

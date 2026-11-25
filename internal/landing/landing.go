@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/orzazade/landed/internal/transcript"
@@ -768,10 +769,46 @@ func (s *Sources) repoCommits(top string, from time.Time) ([]commit, error) {
 	if s.commits == nil {
 		s.commits = map[string]commitResult{}
 	}
-	key := top + "|" + since.Format(time.RFC3339)
+	key := commitKey(top, since)
 	if r, ok := s.commits[key]; ok {
 		return r.list, r.err
 	}
+	r := s.readCommits(top, since)
+	s.commits[key] = r
+	return r.list, r.err
+}
+
+func commitKey(top string, since time.Time) string { return top + "|" + since.Format(time.RFC3339) }
+
+// PrefetchCommits reads the commits since Since of every repo in Repos,
+// several repos at once, so Gather finds them already read.
+func (s *Sources) PrefetchCommits() {
+	if s.Since.IsZero() || len(s.Repos) == 0 {
+		return
+	}
+	res := make([]commitResult, len(s.Repos))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 8)
+	for i, r := range s.Repos {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			res[i] = s.readCommits(r, s.Since)
+		}()
+	}
+	wg.Wait()
+	if s.commits == nil {
+		s.commits = map[string]commitResult{}
+	}
+	for i, r := range s.Repos {
+		s.commits[commitKey(r, s.Since)] = res[i]
+	}
+}
+
+// readCommits runs git log in top for the commits since since.
+func (s *Sources) readCommits(top string, since time.Time) commitResult {
 	out, err := exec.Command(s.git(), "-C", top, "log", "--all", "--since="+since.Add(-time.Minute).Format(time.RFC3339),
 		"--format=%x1e%H%x1f%ct%x1f%s%x1f%b%x1f", "--name-only").Output()
 	var r commitResult
@@ -802,8 +839,7 @@ func (s *Sources) repoCommits(top string, from time.Time) ([]commit, error) {
 			r.list = append(r.list, commit{hash: f[0], when: time.Unix(sec, 0), subject: f[2], text: text})
 		}
 	}
-	s.commits[key] = r
-	return r.list, r.err
+	return r
 }
 
 func (s *Sources) busLines() ([]busLine, error) {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +18,7 @@ import (
 )
 
 type fakeJudge struct {
+	mu     sync.Mutex
 	calls  int
 	ids    []string // every item asked, in order
 	record map[string]int
@@ -24,6 +26,8 @@ type fakeJudge struct {
 }
 
 func (f *fakeJudge) Judge(_ context.Context, items []decide.JudgeItem) ([]decide.JudgeAnswer, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls++
 	if f.err != nil {
 		return nil, f.err
@@ -60,12 +64,12 @@ func TestJudgePicksCachesAndFailsToUnknown(t *testing.T) {
 	fj := &fakeJudge{record: map[string]int{"spout": 0, "handle": -1}}
 	jg := &judging{st: st, j: fj}
 	got := jg.finish(context.Background(), pend)
-	if got[0].State != landing.Landed || got[1].State != landing.Missing || fj.calls != 1 {
+	if got[0].State != landing.Landed || got[1].State != landing.Missing || fj.calls != 2 { // a call per decision
 		t.Fatalf("got %v %v, calls %d", got[0].State, got[1].State, fj.calls)
 	}
 	jg2 := &judging{st: st, j: fj}
 	jg2.finish(context.Background(), pend)
-	if fj.calls != 1 || jg2.cached != 2 {
+	if fj.calls != 2 || jg2.cached != 2 {
 		t.Errorf("second run asked again: calls %d cached %d", fj.calls, jg2.cached)
 	}
 	bad := &judging{st: st, j: &fakeJudge{err: errors.New("quota")}}
@@ -146,9 +150,14 @@ func TestJudgeRetriesUnparsedReply(t *testing.T) {
 	}
 }
 
-type keyRefusal struct{ calls int }
+type keyRefusal struct {
+	mu    sync.Mutex
+	calls int
+}
 
 func (f *keyRefusal) Judge(context.Context, []decide.JudgeItem) ([]decide.JudgeAnswer, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls++
 	return nil, fmt.Errorf("%w (apiKeySource %q)", decide.ErrAPIKey, "ANTHROPIC_API_KEY")
 }
@@ -167,12 +176,18 @@ func TestJudgeStopsAtAPIKeyRefusal(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	pend := []pending{gather(t, "a", "lid", "hinge"), gather(t, "b", "spout", "filter"), gather(t, "c", "base", "cable")}
+	// Calls run side by side (the real judge proves the login once before
+	// any of them, see decide's probe tests): after a refusal, no call starts
+	// beyond those already running, one per worker.
+	var pend []pending
+	for i := range 3 * judgeWorkers {
+		pend = append(pend, gather(t, fmt.Sprint("d", i), "lid", fmt.Sprint("hinge", i)))
+	}
 	f := &keyRefusal{}
 	jg := &judging{st: st, j: f, batch: 1}
 	got := jg.finish(context.Background(), pend)
-	if f.calls != 1 {
-		t.Errorf("judge called %d times after an API-key refusal; want 1", f.calls)
+	if f.calls > judgeWorkers {
+		t.Errorf("judge called %d times after an API-key refusal; want at most one per worker (%d)", f.calls, judgeWorkers)
 	}
 	for _, c := range got {
 		if c.State != landing.Unknown {
@@ -264,7 +279,7 @@ func TestLandedOutcomeIsCached(t *testing.T) {
 	}
 	j := &fakeJudge{record: map[string]int{"a": 0, "b": -1}}
 	first := run(j, "lid hinge spout filter v1")
-	if first[0].State != landing.Landed || first[1].State != landing.Missing || j.calls != 1 {
+	if first[0].State != landing.Landed || first[1].State != landing.Missing || j.calls != 2 { // a call per decision
 		t.Fatalf("first run: %v %v, %d calls", first[0].State, first[1].State, j.calls)
 	}
 	j2 := &fakeJudge{record: map[string]int{"a": -1, "b": -1}} // would now say "a" is missing
@@ -371,4 +386,95 @@ func (f *replacer) Judge(_ context.Context, items []decide.JudgeItem) ([]decide.
 		out = append(out, decide.JudgeAnswer{ID: it.ID, Record: -1, Replaced: 0, Why: "made-up: a later choice replaces it"})
 	}
 	return out, nil
+}
+
+// barrierJudge holds each judge or check call until want calls of that kind
+// are in flight (or 2 s pass), and records the items per call. Every pick
+// is a record and passes its check.
+type barrierJudge struct {
+	want int
+	mu   sync.Mutex
+	kind map[string]*barrier
+}
+
+type barrier struct {
+	active, maxSeen int
+	sizes           []int
+	all             chan struct{}
+}
+
+func (b *barrierJudge) hold(kind string, n int) {
+	b.mu.Lock()
+	if b.kind == nil {
+		b.kind = map[string]*barrier{}
+	}
+	k := b.kind[kind]
+	if k == nil {
+		k = &barrier{all: make(chan struct{})}
+		b.kind[kind] = k
+	}
+	k.active++
+	k.maxSeen = max(k.maxSeen, k.active)
+	k.sizes = append(k.sizes, n)
+	if k.active == b.want {
+		close(k.all)
+	}
+	b.mu.Unlock()
+	select {
+	case <-k.all:
+	case <-time.After(2 * time.Second):
+	}
+	b.mu.Lock()
+	k.active--
+	b.mu.Unlock()
+}
+
+func (b *barrierJudge) Judge(_ context.Context, items []decide.JudgeItem) ([]decide.JudgeAnswer, error) {
+	b.hold("judge", len(items))
+	var out []decide.JudgeAnswer
+	for _, it := range items {
+		out = append(out, decide.JudgeAnswer{ID: it.ID, Record: 0, Replaced: -1, Why: "made-up reason"})
+	}
+	return out, nil
+}
+
+func (b *barrierJudge) Verify(_ context.Context, items []decide.VerifyItem) ([]decide.VerifyAnswer, error) {
+	b.hold("check", len(items))
+	var out []decide.VerifyAnswer
+	for _, it := range items {
+		out = append(out, decide.VerifyAnswer{ID: it.ID, Records: true, Quote: it.Record, Why: "made-up reason"})
+	}
+	return out, nil
+}
+
+// A cold run's open decisions are spread over every judge worker at once,
+// none alone: 7 decisions are 7 calls of one side by side, and so are the
+// checks of their picks, not one call of 7 each.
+func TestJudgeSpreadsDecisionsOverWorkers(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "l.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	var pend []pending
+	for i := range 7 {
+		pend = append(pend, gather(t, fmt.Sprint("d", i), "lid", fmt.Sprint("hinge", i)))
+	}
+	bj := &barrierJudge{want: 7}
+	got := newJudging(st, bj, "haiku", nil).finish(context.Background(), pend)
+	for i, c := range got {
+		if c.State != landing.Landed {
+			t.Errorf("row %d: %v (%s)", i, c.State, c.Why)
+		}
+	}
+	for _, kind := range []string{"judge", "check"} {
+		k := bj.kind[kind]
+		if k == nil {
+			t.Errorf("no %s call", kind)
+			continue
+		}
+		if len(k.sizes) != 7 || k.maxSeen != 7 || slices.Max(k.sizes) != 1 {
+			t.Errorf("%s calls with %v items, at most %d at once; want 7 calls of one, all at once", kind, k.sizes, k.maxSeen)
+		}
+	}
 }

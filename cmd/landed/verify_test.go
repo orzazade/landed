@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -23,6 +24,8 @@ type verifyJudge struct {
 }
 
 func (v *verifyJudge) Verify(_ context.Context, items []decide.VerifyItem) ([]decide.VerifyAnswer, error) {
+	v.mu.Lock() // the embedded fakeJudge's lock: checks run side by side
+	defer v.mu.Unlock()
 	var out []decide.VerifyAnswer
 	for _, it := range items {
 		v.checked = append(v.checked, it.ID)
@@ -230,5 +233,45 @@ func TestAPIKeyInCheckStopsRounds(t *testing.T) {
 	got := newJudging(st, rj, "haiku", nil).finish(context.Background(), pend)
 	if got[0].State != landing.Unknown || rj.rounds != 1 || rj.checks != 1 {
 		t.Errorf("state %v (%s), %d judge rounds, %d checks; want ? after one of each", got[0].State, got[0].Why, rj.rounds, rj.checks)
+	}
+}
+
+// A check reads only the decision and the one picked record, so its answer
+// is kept: when a later run has new candidates (the judge is asked again) and
+// the judge picks the same record, the check is not asked again, and the row
+// comes out the same.
+func TestCheckOfSamePickIsCached(t *testing.T) {
+	t0 := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
+	st, err := store.Open(filepath.Join(t.TempDir(), "l.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cwd := t.TempDir()
+	mk := func(notes ...string) []pending {
+		var later []transcript.Action
+		for i, n := range notes {
+			later = append(later, transcript.Action{Time: t0.Add(time.Duration(i+1) * time.Minute), Tool: "Edit", Path: fmt.Sprintf("/x/n%d.md", i), Text: n})
+		}
+		src := &landing.Sources{Window: 7 * 24 * time.Hour, Now: t0.Add(48 * time.Hour)}
+		c, cands := src.Gather(landing.Decision{ID: "d", Cwd: cwd, Time: t0, Summary: "spout stays ceramic", Keywords: []string{"spout", "ceramic"}, Later: later})
+		return []pending{{c, cands}}
+	}
+	answer := map[string]decide.VerifyAnswer{"d": {Records: true, Quote: "the spout stays ceramic", Why: "states it"}}
+	first := &verifyJudge{verify: answer}
+	got1 := newJudging(st, first, "haiku", nil).finish(context.Background(), mk("Decided: the spout stays ceramic."))
+	if got1[0].State != landing.Landed || len(first.checked) != 1 {
+		t.Fatalf("first run: %v (%s), checked %v", got1[0].State, got1[0].Why, first.checked)
+	}
+	again := &verifyJudge{verify: answer}
+	got2 := newJudging(st, again, "haiku", nil).finish(context.Background(), mk("Decided: the spout stays ceramic.", "ceramic spout makers, later"))
+	if again.calls != 1 {
+		t.Fatalf("judge calls %d on new candidates; want 1 (the fixture must miss the judgment cache)", again.calls)
+	}
+	if len(again.checked) != 0 {
+		t.Errorf("same pick checked again: %v", again.checked)
+	}
+	if got2[0].State != got1[0].State || got2[0].Why != got1[0].Why {
+		t.Errorf("second run %v (%s), first %v (%s)", got2[0].State, got2[0].Why, got1[0].State, got1[0].Why)
 	}
 }

@@ -27,8 +27,15 @@ type Stats struct {
 
 const maxText, maxPrev = 1500, 400
 
-// modelWorkers is how many model calls run at once after the first.
-const modelWorkers = 4
+// modelWorkers is how many model calls run at once.
+const modelWorkers = 8
+
+// PerCall is how many of n items go in one call: spread over every worker,
+// so a cold run waits about one short call, not one long call; at least
+// least and at most most a call.
+func PerCall(n, least, most, workers int) int {
+	return min(most, max(least, (n+workers-1)/workers))
+}
 
 // minKeywords is how many keywords a decision needs for its landing check.
 const minKeywords = 2
@@ -69,12 +76,13 @@ func Find(ctx context.Context, turns []transcript.Turn, st *store.Store, m Model
 			ask = append(ask, i)
 		}
 	}
-	// The model calls run first: the first batch alone (it proves the login),
-	// the rest a few at a time. The answers are then read in batch order.
+	// The model calls run first, side by side (the model proves the login
+	// once before them). The answers are then read in batch order.
 	type reply struct {
 		byID map[string]Answer
 		err  error
 	}
+	batch = PerCall(len(ask), 2, batch, modelWorkers) // 2: each call also sends the prompt
 	var batches [][]int
 	for start := 0; start < len(ask); start += batch {
 		batches = append(batches, ask[start:min(start+batch, len(ask))])
@@ -128,10 +136,9 @@ func Find(ctx context.Context, turns []transcript.Turn, st *store.Store, m Model
 		replies[k] = reply{byID, err}
 	}
 	if m != nil && len(batches) > 0 {
-		ask1(0)
 		var wg sync.WaitGroup
 		sem := make(chan struct{}, modelWorkers)
-		for k := 1; k < len(batches); k++ {
+		for k := range batches {
 			wg.Add(1)
 			sem <- struct{}{}
 			go func() {

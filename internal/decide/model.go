@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 )
 
 // Item is one turn sent to the model.
@@ -40,6 +41,9 @@ const systemPrompt = `You label messages a solo developer typed to AI coding age
 For each decision write "kind": "action" when it is a one-off request carried out now, whose result is the work itself: run, check, review or explain something, post or edit a comment, move an account, thread or tab, open or close sessions, stop or restart work, build or fix this now. A short answer that approves, picks or adjusts the step the agent just proposed ("go", "2", "yes do both", "use the browser then") is "action", unless that proposal is itself a standing rule. Saying who does the step the agent just handed back or asked about ("you do it", "you will handle all", "you did it for the other project, do it here", "I'll send it, we keep our focus") is "action", and so is correcting how to do the current step ("use the literal path, then rerun"). "rule" only when it must still hold after this task is done: a standing rule or preference (from now on, never, always), a lasting choice (design, tool, vendor, architecture; keep or drop a feature; a priority; who owns an area from now on, not who does this one step), or a plan someone must remember later. Then write "summary": a neutral one-line restatement of WHAT was decided (max 15 words; for a short answer, say what it chose using "prev"), and "keywords": 3-5 distinctive topic words or short names a commit message, status note or log line recording it would contain: the thing it is about (feature, file, tool, setting, machine), never the form of the answer ("option", "choice", "yes", "approve", "later") and never generic words ("owner", "update", "change", "remove", "add"). For non-decisions use "" and [].
 Reply with ONLY a JSON array, one object per input message, in input order: [{"id":"...","decision":true|false,"kind":"action"|"rule"|"","summary":"...","keywords":["..."]}]`
 
+// loginPrompt is the system prompt of the tiny call that proves the login.
+const loginPrompt = "Reply with the single word ok."
+
 // ClaudeCLI runs `claude -p` on the owner's own Max login. It never uses an
 // API key: every ANTHROPIC_* and CLAUDE_CODE_USE_* variable is removed from the
 // child's environment, no --bare (which needs an API key) is used, and a run
@@ -70,12 +74,47 @@ func (c ClaudeCLI) Classify(ctx context.Context, items []Item) ([]Answer, error)
 	return parseAnswers(result, items)
 }
 
-// run sends one prompt to `claude -p` and returns the result text.
-func (c ClaudeCLI) run(ctx context.Context, prompt string, in []byte) (string, error) {
-	bin, model := c.Bin, c.Model
-	if bin == "" {
-		bin = "claude"
+// logins holds one login probe per claude binary: a run probes once.
+var logins sync.Map // bin -> *login
+
+type login struct {
+	once sync.Once
+	err  error
+}
+
+// proveLogin makes one tiny call, once per run, before any real call starts.
+// Calls then run side by side; an API key is found by that one probe, so no
+// real call ever starts on one. Other probe failures are left to the calls,
+// which report their own reason.
+func (c ClaudeCLI) proveLogin(ctx context.Context) error {
+	v, _ := logins.LoadOrStore(c.bin(), &login{})
+	l := v.(*login)
+	l.once.Do(func() { _, l.err = c.call(ctx, loginPrompt, []byte("ok")) })
+	if errors.Is(l.err, ErrAPIKey) {
+		return l.err
 	}
+	return nil
+}
+
+func (c ClaudeCLI) bin() string {
+	if c.Bin == "" {
+		return "claude"
+	}
+	return c.Bin
+}
+
+// run sends one prompt to `claude -p`, after the run's login probe, and
+// returns the result text.
+func (c ClaudeCLI) run(ctx context.Context, prompt string, in []byte) (string, error) {
+	if err := c.proveLogin(ctx); err != nil {
+		return "", err
+	}
+	return c.call(ctx, prompt, in)
+}
+
+// call sends one prompt to `claude -p` and returns the result text.
+func (c ClaudeCLI) call(ctx context.Context, prompt string, in []byte) (string, error) {
+	bin, model := c.bin(), c.Model
 	if model == "" {
 		model = "haiku"
 	}
@@ -89,6 +128,9 @@ func (c ClaudeCLI) run(ctx context.Context, prompt string, in []byte) (string, e
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	if err := cmd.Run(); err != nil {
+		if ks := initKeySource(out.Bytes()); ks != nil && *ks != "none" {
+			return "", fmt.Errorf("%w (apiKeySource %q)", ErrAPIKey, *ks) // a failed call on an API key is still one
+		}
 		why := strings.TrimSpace(tailStr(errb.String(), 300))
 		if r := streamError(out.Bytes()); r != "" {
 			why = r // stream-json puts the reason (e.g. "Not logged in") on stdout
@@ -173,12 +215,33 @@ func streamError(out []byte) string {
 	return why
 }
 
+// initKeySource is the apiKeySource of the stream's init message (nil: none).
+func initKeySource(out []byte) *string {
+	ks, _, _ := scanStream(out)
+	return ks
+}
+
 // readStream reads `claude -p --output-format stream-json` output. It refuses
 // the answer unless the init message says no API key was used.
 func readStream(out []byte) (string, error) {
-	var keySource *string
-	var result *string
-	isError := false
+	keySource, result, isError := scanStream(out)
+	if keySource == nil {
+		return "", fmt.Errorf("%w (no init message, so the login cannot be checked)", ErrAPIKey)
+	}
+	if *keySource != "none" {
+		return "", fmt.Errorf("%w (apiKeySource %q)", ErrAPIKey, *keySource)
+	}
+	if result == nil {
+		return "", fmt.Errorf("claude -p: no result message")
+	}
+	if isError {
+		return "", fmt.Errorf("claude -p error: %s", tailStr(*result, 300))
+	}
+	return *result, nil
+}
+
+// scanStream reads the init message's apiKeySource and the result message.
+func scanStream(out []byte) (keySource, result *string, isError bool) {
 	for _, line := range bytes.Split(out, []byte("\n")) {
 		if len(bytes.TrimSpace(line)) == 0 {
 			continue
@@ -200,17 +263,5 @@ func readStream(out []byte) (string, error) {
 			result, isError = m.Result, m.IsError
 		}
 	}
-	if keySource == nil {
-		return "", fmt.Errorf("%w (no init message, so the login cannot be checked)", ErrAPIKey)
-	}
-	if *keySource != "none" {
-		return "", fmt.Errorf("%w (apiKeySource %q)", ErrAPIKey, *keySource)
-	}
-	if result == nil {
-		return "", fmt.Errorf("claude -p: no result message")
-	}
-	if isError {
-		return "", fmt.Errorf("claude -p error: %s", tailStr(*result, 300))
-	}
-	return *result, nil
+	return keySource, result, isError
 }
