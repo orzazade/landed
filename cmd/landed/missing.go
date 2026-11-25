@@ -117,14 +117,21 @@ func runChecks(ctx context.Context, o checkOpts, now time.Time) (checked, error)
 	if o.noModel {
 		m = nil
 	}
-	res, stats := decide.Find(ctx, turns, st, m, 25)
-	out.Stats = stats
 	notes := []string(o.notes)
 	if len(notes) == 0 {
 		notes = defaultNoteDirs()
 	}
 	src := &landing.Sources{BusDir: busDir(o.bus, home0()), Window: o.window, Now: now, Since: cut, NoteDirs: notes, Actions: allActions(l)}
-	widen(src, o.reposUnder, !o.noModel)
+	// The sources do not depend on the decisions: they are read while the
+	// model sorts the turns.
+	read := make(chan struct{})
+	go func() {
+		defer close(read)
+		widen(src, o.reposUnder, !o.noModel)
+	}()
+	res, stats := decide.Find(ctx, turns, st, m, 25)
+	out.Stats = stats
+	<-read
 	var jg *judging
 	if !o.noModel {
 		jg = newJudging(st, decide.ClaudeCLI{Model: o.judgeModel}, o.judgeModel, stats.Errors)
@@ -188,9 +195,9 @@ func widen(src *landing.Sources, root string, judged bool) {
 		if src.ReposErr != nil {
 			fmt.Fprintln(os.Stderr, "repos:", src.ReposErr)
 		}
-		src.PrefetchCommits()
 	}
 	src.ChangedNotes, src.AllBus = true, true
+	src.Prefetch()
 }
 
 // allActions: every assistant action of every session read (headless ones

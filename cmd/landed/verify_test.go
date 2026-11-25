@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -273,5 +274,72 @@ func TestCheckOfSamePickIsCached(t *testing.T) {
 	}
 	if got2[0].State != got1[0].State || got2[0].Why != got1[0].Why {
 		t.Errorf("second run %v (%s), first %v (%s)", got2[0].State, got2[0].Why, got1[0].State, got1[0].Why)
+	}
+}
+
+// slowFast: the judge call for "slow" returns only once "fast" is judged a
+// second time (or after 2 s). Every check refuses.
+type slowFast struct {
+	mu       sync.Mutex
+	fast     int
+	second   chan struct{}
+	timedOut bool
+}
+
+func (s *slowFast) Judge(_ context.Context, items []decide.JudgeItem) ([]decide.JudgeAnswer, error) {
+	var out []decide.JudgeAnswer
+	for _, it := range items {
+		rec := -1
+		switch it.ID {
+		case "fast":
+			s.mu.Lock()
+			s.fast++
+			if s.fast == 1 {
+				rec = 0
+			}
+			if s.fast == 2 {
+				close(s.second)
+			}
+			s.mu.Unlock()
+		case "slow":
+			select {
+			case <-s.second:
+			case <-time.After(2 * time.Second):
+				s.mu.Lock()
+				s.timedOut = true
+				s.mu.Unlock()
+			}
+		}
+		out = append(out, decide.JudgeAnswer{ID: it.ID, Record: rec, Replaced: -1, Why: "made-up reason"})
+	}
+	return out, nil
+}
+
+func (s *slowFast) Verify(_ context.Context, items []decide.VerifyItem) ([]decide.VerifyAnswer, error) {
+	var out []decide.VerifyAnswer
+	for _, it := range items {
+		out = append(out, decide.VerifyAnswer{ID: it.ID, Records: false, Why: "made-up refusal"})
+	}
+	return out, nil
+}
+
+// Each decision runs its own rounds: a refused pick is judged again at once,
+// not after the slowest other decision of the round is answered.
+func TestDecisionDoesNotWaitForSlowerOne(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "l.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	pend := []pending{gather(t, "slow", "lid", "hinge"), gather(t, "fast", "spout", "filter")}
+	sf := &slowFast{second: make(chan struct{})}
+	got := newJudging(st, sf, "haiku", nil).finish(context.Background(), pend)
+	if sf.timedOut {
+		t.Error("fast's second round waited for slow's first judge call")
+	}
+	for _, c := range got {
+		if c.State != landing.Missing {
+			t.Errorf("%s: %v (%s), want missing", c.Decision.ID, c.State, c.Why)
+		}
 	}
 }

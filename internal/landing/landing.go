@@ -780,9 +780,14 @@ func (s *Sources) repoCommits(top string, from time.Time) ([]commit, error) {
 
 func commitKey(top string, since time.Time) string { return top + "|" + since.Format(time.RFC3339) }
 
-// PrefetchCommits reads the commits since Since of every repo in Repos,
-// several repos at once, so Gather finds them already read.
-func (s *Sources) PrefetchCommits() {
+// Prefetch reads the notes, the bus lines and the commits since Since of
+// every repo in Repos (several repos at once), so Gather finds them already
+// read. None of them depend on the decisions.
+func (s *Sources) Prefetch() {
+	s.notesList()
+	if s.BusDir != "" {
+		s.busLines()
+	}
 	if s.Since.IsZero() || len(s.Repos) == 0 {
 		return
 	}

@@ -6,10 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 )
 
 // Item is one turn sent to the model.
@@ -112,6 +115,26 @@ func (c ClaudeCLI) run(ctx context.Context, prompt string, in []byte) (string, e
 	return c.call(ctx, prompt, in)
 }
 
+// workDir is an empty folder of landed's own for claude to start in, away
+// from any project's CLAUDE.md. claude reads its start folder: the shared
+// temp folder held 30,000 files, 10 s of CPU a start (measured 11-26).
+// The temp folder may be shared by every user (Linux /tmp): the folder is
+// named per user and must be a real folder this user owns.
+func workDir() (string, error) {
+	d := filepath.Join(os.TempDir(), fmt.Sprintf("landed-claude-%d", os.Getuid()))
+	if err := os.Mkdir(d, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
+		return "", err
+	}
+	fi, err := os.Lstat(d)
+	if err != nil {
+		return "", err
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); !fi.IsDir() || !ok || int(st.Uid) != os.Getuid() {
+		return "", fmt.Errorf("%s is not a folder of this user's own", d)
+	}
+	return d, nil
+}
+
 // call sends one prompt to `claude -p` and returns the result text.
 func (c ClaudeCLI) call(ctx context.Context, prompt string, in []byte) (string, error) {
 	bin, model := c.bin(), c.Model
@@ -122,8 +145,12 @@ func (c ClaudeCLI) call(ctx context.Context, prompt string, in []byte) (string, 
 		"--tools", "", "--strict-mcp-config", "--disable-slash-commands",
 		"--no-session-persistence", "--setting-sources", "",
 		"--system-prompt", prompt, "--output-format", "stream-json", "--verbose")
+	dir, err := workDir()
+	if err != nil {
+		return "", fmt.Errorf("claude -p: %w", err)
+	}
 	cmd.Env = cliEnv()
-	cmd.Dir = os.TempDir()
+	cmd.Dir = dir
 	cmd.Stdin = bytes.NewReader(in)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb

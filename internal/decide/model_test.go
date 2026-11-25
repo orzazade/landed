@@ -100,3 +100,47 @@ func TestLoginProbedOncePerRun(t *testing.T) {
 		t.Errorf("claude started %q; want one probe, then the three calls", got)
 	}
 }
+
+// claude reads the folder it starts in; the shared temp folder can hold tens
+// of thousands of files (10 s of CPU per start, measured 11-26). Each call
+// starts in an empty folder of landed's own.
+func TestClaudeStartsInEmptyFolder(t *testing.T) {
+	dir := t.TempDir()
+	bin, log := filepath.Join(dir, "claude"), filepath.Join(dir, "where")
+	script := "#!/bin/sh\n" +
+		`echo "$PWD $(ls -A | wc -l | tr -d ' ')" >> ` + log + "\n" +
+		`cat > /dev/null` + "\n" +
+		`echo '{"type":"system","subtype":"init","apiKeySource":"none"}'` + "\n" +
+		`echo '{"type":"result","subtype":"success","is_error":false,"result":"[]"}'` + "\n"
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (ClaudeCLI{Bin: bin}).Classify(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmp, _ := filepath.EvalSymlinks(os.TempDir())
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		where, n, _ := strings.Cut(line, " ")
+		w, _ := filepath.EvalSymlinks(where)
+		if w == tmp || n != "0" {
+			t.Errorf("claude started in %s with %s entries; want an empty folder of its own, not the shared temp folder", where, n)
+		}
+	}
+}
+
+// A link planted at the start folder's name (another user on a shared /tmp)
+// is refused, never followed.
+func TestStartFolderMustBeOwnFolder(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	if err := os.Symlink(t.TempDir(), filepath.Join(tmp, fmt.Sprintf("landed-claude-%d", os.Getuid()))); err != nil {
+		t.Fatal(err)
+	}
+	if d, err := workDir(); err == nil || !strings.Contains(err.Error(), "not a folder of this user's own") {
+		t.Errorf("workDir() = %q, %v; want the planted link refused", d, err)
+	}
+}

@@ -110,7 +110,7 @@ func TestJudgeRetriesSkippedItems(t *testing.T) {
 		pend = append(pend, pending{c, cands})
 	}
 	f := &skipFirst{}
-	jg := &judging{st: st, j: f}
+	jg := &judging{st: st, j: f, batch: 2} // both in one call: the retry asks for the skipped one
 	got := jg.finish(context.Background(), pend)
 	if f.calls != 2 || len(jg.errs) != 0 || got[0].State != landing.Landed || got[1].State != landing.Landed {
 		t.Errorf("calls %d errs %v states %v %v", f.calls, jg.errs, got[0].State, got[1].State)

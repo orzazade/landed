@@ -570,9 +570,11 @@ func TestLateSessionActionIsACandidate(t *testing.T) {
 	}
 }
 
-// Commits read ahead, several repos at once, are the same candidates Gather
-// finds by reading each repo itself, and Gather runs no git log after them.
-func TestPrefetchedCommitsAreTheSame(t *testing.T) {
+// Commits, notes and bus lines read ahead (repos several at once) are the
+// same candidates Gather finds by reading them itself, and Gather reads
+// none of them again.
+func TestPrefetchedSourcesAreTheSame(t *testing.T) {
+	knownBirth(t)
 	t0 := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
 	var repos []string
 	for i := range 12 {
@@ -583,17 +585,33 @@ func TestPrefetchedCommitsAreTheSame(t *testing.T) {
 		commitAt(t, r, t0.Add(time.Duration(i+1)*time.Minute), "dial.go", "package ui\n", fmt.Sprintf("temperature dial %d shows celsius", i))
 		repos = append(repos, r)
 	}
+	notes, bus := t.TempDir(), t.TempDir()
+	note, busLog := filepath.Join(notes, "dial.md"), filepath.Join(bus, "kettle.log")
+	if err := os.WriteFile(note, []byte("decided: the temperature dial shows celsius\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(busLog, []byte(t0.Add(time.Hour).Format("2006-01-02T15:04")+" DECISION crius:lead -> kettle:lead — temperature dial shows celsius\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Add(time.Hour) // the note is new: written just now
 	d := Decision{ID: "a", Time: t0, Keywords: []string{"temperature dial", "celsius"}}
 	mk := func() *Sources {
-		return &Sources{Window: 7 * 24 * time.Hour, Now: t0.Add(48 * time.Hour), Since: t0.Add(-time.Hour), Repos: repos}
+		return &Sources{Window: 365 * 24 * time.Hour, Now: now, Since: t0.Add(-time.Hour), Repos: repos,
+			NoteDirs: []string{notes}, ChangedNotes: true, BusDir: bus, AllBus: true, Loc: time.UTC}
 	}
 	_, want := mk().Gather(d)
-	if len(want) != len(repos) {
-		t.Fatalf("control: %d candidates, want one commit per repo (%d)", len(want), len(repos))
+	kinds := map[string]int{}
+	for _, e := range want {
+		kinds[e.Kind]++
+	}
+	if kinds["commit"] != len(repos) || kinds["note"] != 1 || kinds["bus"] != 1 {
+		t.Fatalf("control: candidates by kind %v, want a commit per repo (%d), one note, one bus line", kinds, len(repos))
 	}
 	src := mk()
-	src.PrefetchCommits()
+	src.Prefetch()
 	src.Git = filepath.Join(t.TempDir(), "no-git") // any git log now would fail
+	os.Remove(note)                                // and so would reading these
+	os.Remove(busLog)
 	_, got := src.Gather(d)
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("prefetched candidates differ:\n got %+v\nwant %+v", got, want)

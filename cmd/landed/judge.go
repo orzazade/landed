@@ -134,6 +134,31 @@ func (jg *judging) finish(ctx context.Context, pend []pending) []landing.Check {
 			}
 		}
 	}
+	// Each group of decisions (one call's worth) runs its own rounds, groups
+	// side by side (the judge proves the login once before): a refused pick
+	// is judged again at once, never after a slower group's calls.
+	n := jg.perCall(len(asks))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, judgeWorkers)
+	for len(asks) > 0 {
+		g := asks[:min(n, len(asks))]
+		asks = asks[len(g):]
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			jg.rounds(ctx, pend, g, out)
+		}()
+	}
+	wg.Wait()
+	return out
+}
+
+// rounds judges one group of decisions: a call, the check of its picks,
+// and again with refused picks ruled out, up to judgeRounds times. It writes
+// only out[i] of its own decisions.
+func (jg *judging) rounds(ctx context.Context, pend []pending, asks []pick, out []landing.Check) {
 	for round := 1; len(asks) > 0; round++ {
 		picks := jg.round(ctx, pend, asks, out)
 		jg.verify(ctx, pend, picks)
@@ -156,70 +181,39 @@ func (jg *judging) finish(ctx context.Context, pend []pending) []landing.Check {
 				}
 			}
 			if e := jg.st.PutJudgment(store.Judgment{Key: pk.key, Record: r.Record, Replaced: r.Replaced, Why: r.Why}); e != nil {
-				jg.errs = append(jg.errs, "judgment cache: "+e.Error())
+				jg.addErr("judgment cache: " + e.Error())
 			}
 			out[pk.i] = landing.Finish(p.c, p.cands, r.Record, r.Replaced, "judge: "+r.Why)
 		}
 	}
-	return out
 }
 
-// round asks the judge about every ask, in batches; a decision the judge
+// round asks the judge about every ask in one call; a decision the judge
 // does not answer becomes ? in out.
 func (jg *judging) round(ctx context.Context, pend []pending, asks []pick, out []landing.Check) []pick {
-	n := jg.perCall(len(asks))
-	var batches [][]pick
-	for len(asks) > 0 {
-		b := asks[:min(n, len(asks))]
-		asks = asks[len(b):]
-		batches = append(batches, b)
+	items := make([]decide.JudgeItem, len(asks))
+	for i, a := range asks {
+		items[i] = judgeItem(pend[a.i], a.ruled)
 	}
-	type reply struct {
-		ans []decide.JudgeAnswer
-		err error
+	ans, err := jg.call(ctx, items)
+	byID := map[string]decide.JudgeAnswer{}
+	for _, a := range ans {
+		byID[a.ID] = a
 	}
-	replies := make([]reply, len(batches))
-	call := func(k int) {
-		items := make([]decide.JudgeItem, len(batches[k]))
-		for i, a := range batches[k] {
-			items[i] = judgeItem(pend[a.i], a.ruled)
-		}
-		replies[k].ans, replies[k].err = jg.call(ctx, items)
-	}
-	// All batches run side by side (the judge proves the login once before).
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, judgeWorkers)
-	for k := range batches {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func() {
-			defer wg.Done()
-			defer func() { <-sem }()
-			call(k)
-		}()
-	}
-	wg.Wait()
 	var picks []pick
-	for k, b := range batches {
-		ans, err := replies[k].ans, replies[k].err
-		byID := map[string]decide.JudgeAnswer{}
-		for _, a := range ans {
-			byID[a.ID] = a
-		}
-		for _, a := range b {
-			p := pend[a.i]
-			r, ok := byID[p.c.Decision.ID]
-			if !ok {
-				msg := "judge gave no answer"
-				if err != nil {
-					msg = "judge failed: " + err.Error()
-				}
-				jg.fail(&out[a.i], p, msg)
-				continue
+	for _, a := range asks {
+		p := pend[a.i]
+		r, ok := byID[p.c.Decision.ID]
+		if !ok {
+			msg := "judge gave no answer"
+			if err != nil {
+				msg = "judge failed: " + err.Error()
 			}
-			a.ans, a.refused = r, -1
-			picks = append(picks, a)
+			jg.fail(&out[a.i], p, msg)
+			continue
 		}
+		a.ans, a.refused = r, -1
+		picks = append(picks, a)
 	}
 	return picks
 }
@@ -234,9 +228,9 @@ type pick struct {
 	failed  string         // the check of the pick failed: the row is ?
 }
 
-// verify checks every pick of a record in a call of its own. A pick the
-// check refuses, or whose quote is not in the record, becomes "no record"
-// and is marked refused, so the next round rules it out.
+// verify checks every pick of a record, in one call apart from the judge's.
+// A pick the check refuses, or whose quote is not in the record, becomes
+// "no record" and is marked refused, so the next round rules it out.
 // With no verifier (tests that do not check picks) picks stand as given.
 func (jg *judging) verify(ctx context.Context, pend []pending, picks []pick) {
 	if jg.v == nil {
@@ -257,12 +251,11 @@ func (jg *judging) verify(ctx context.Context, pend []pending, picks []pick) {
 	// A check reads only the decision and the picked record: one asked
 	// before (in this run or an earlier one) is answered from the cache.
 	ans := map[string]decide.VerifyAnswer{}
-	errOf := map[string]error{}
 	var ask []decide.VerifyItem
 	for _, it := range items {
 		c, ok, err := jg.st.PickCheck(checkKey(it, jg.model))
 		if err != nil {
-			jg.errs = append(jg.errs, "check cache: "+err.Error()) // loud, then asked as usual
+			jg.addErr("check cache: " + err.Error()) // loud, then asked as usual
 		}
 		if ok {
 			ans[it.ID] = decide.VerifyAnswer{ID: it.ID, Records: c.Records, Quote: c.Quote, Why: c.Why}
@@ -270,53 +263,26 @@ func (jg *judging) verify(ctx context.Context, pend []pending, picks []pick) {
 		}
 		ask = append(ask, it)
 	}
-	n := jg.perCall(len(ask))
-	var mu sync.Mutex
-	run := func(b []decide.VerifyItem) {
+	var err error
+	if len(ask) > 0 {
 		jg.mu.Lock()
 		stopped := jg.stopped
 		jg.mu.Unlock()
 		var got []decide.VerifyAnswer
-		var err error
 		if stopped != nil {
 			err = stopped
 		} else {
-			got, err = jg.v.Verify(ctx, b)
+			got, err = jg.v.Verify(ctx, ask)
 			jg.stop(err)
 		}
-		mu.Lock()
-		defer mu.Unlock()
 		for _, a := range got {
 			ans[a.ID] = a
 		}
-		for _, it := range b {
-			if _, ok := ans[it.ID]; !ok {
-				errOf[it.ID] = err
-			}
-		}
-	}
-	var batches [][]decide.VerifyItem
-	for rest := ask; len(rest) > 0; {
-		b := rest[:min(n, len(rest))]
-		rest = rest[len(b):]
-		batches = append(batches, b)
-	}
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, judgeWorkers)
-	for _, b := range batches {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func() {
-			defer wg.Done()
-			defer func() { <-sem }()
-			run(b)
-		}()
-	}
-	wg.Wait()
-	for _, it := range ask {
-		if a, ok := ans[it.ID]; ok {
-			if err := jg.st.PutPickCheck(store.PickCheck{Key: checkKey(it, jg.model), Records: a.Records, Quote: a.Quote, Why: a.Why}); err != nil {
-				jg.errs = append(jg.errs, "check cache: "+err.Error())
+		for _, it := range ask {
+			if a, ok := ans[it.ID]; ok {
+				if e := jg.st.PutPickCheck(store.PickCheck{Key: checkKey(it, jg.model), Records: a.Records, Quote: a.Quote, Why: a.Why}); e != nil {
+					jg.addErr("check cache: " + e.Error())
+				}
 			}
 		}
 	}
@@ -326,7 +292,7 @@ func (jg *judging) verify(ctx context.Context, pend []pending, picks []pick) {
 		switch {
 		case !ok:
 			pk.failed = "check of the judge's pick gave no answer"
-			if err := errOf[items[j].ID]; err != nil {
+			if err != nil {
 				pk.failed = "check of the judge's pick failed: " + err.Error()
 			}
 		case !a.Records:
@@ -433,9 +399,16 @@ func (jg *judging) stop(err error) bool {
 	return jg.stopped != nil
 }
 
+// addErr records a failure; groups of decisions run side by side.
+func (jg *judging) addErr(msg string) {
+	jg.mu.Lock()
+	defer jg.mu.Unlock()
+	jg.errs = append(jg.errs, msg)
+}
+
 // fail leaves the row as ?: the candidates were never judged.
 func (jg *judging) fail(c *landing.Check, p pending, msg string) {
-	jg.errs = append(jg.errs, p.c.Decision.ID+": "+msg)
+	jg.addErr(p.c.Decision.ID + ": " + msg)
 	*c = p.c
 	c.State = landing.Unknown
 	c.Why = msg
